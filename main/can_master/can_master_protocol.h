@@ -1,0 +1,44 @@
+#ifndef CAN_MASTER_PROTOCOL_H
+#define CAN_MASTER_PROTOCOL_H
+
+#include <stdint.h>
+
+#define CAN_PROTOCOL_VERSION        1U
+
+#define CAN_CMD_ID_BASE             0x100U
+#define CAN_CMD_ID_BROADCAST        0x17FU
+#define CAN_RESP_ID_BASE            0x180U
+#define CAN_STATUS_ID_BASE          0x700U
+
+#define CAN_NODE_ID_MAX             0x7FU
+#define CAN_PROGRAM_SLOT_COUNT      4U
+
+typedef enum {
+    CAN_CMD_GET_STATUS = 0x01,
+    CAN_CMD_ARM = 0x02,
+    CAN_CMD_DISARM = 0x03,
+    CAN_CMD_HOME = 0x04,
+    CAN_CMD_STOP = 0x05,
+    CAN_CMD_UPLOAD_BEGIN = 0x10,
+    CAN_CMD_UPLOAD_DATA = 0x11,
+    CAN_CMD_UPLOAD_END = 0x12,
+    CAN_CMD_PROGRAM_RUN = 0x13,
+    CAN_CMD_PROGRAM_DELETE = 0x14,
+    CAN_CMD_PREPARE = 0x20,
+    CAN_CMD_SYNC_START = 0x21,
+} can_command_id_t;
+
+typedef enum {
+    CAN_PROTO_OK = 0x00,
+    CAN_PROTO_ERR_INVALID_CMD = 0x01,
+    CAN_PROTO_ERR_INVALID_LENGTH = 0x02,
+    CAN_PROTO_ERR_INVALID_SLOT = 0x03,
+    CAN_PROTO_ERR_UPLOAD_STATE = 0x04,
+    CAN_PROTO_ERR_SEQUENCE = 0x05,
+    CAN_PROTO_ERR_BUSY = 0x06,
+    CAN_PROTO_ERR_NOT_READY = 0x07,
+    CAN_PROTO_ERR_FILE = 0x08,
+    CAN_PROTO_ERR_EXEC = 0x09,
+} can_protocol_result_t;
+
+#endif // CAN_MASTER_PROTOCOL_H
