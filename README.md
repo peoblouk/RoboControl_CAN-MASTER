@@ -1,23 +1,49 @@
-# CAN MAIN Node (ESP-IDF / MCP2515 SPI)
+﻿# CAN Master (ESP-IDF + MCP2515)
 
-This project is now configured as a CAN MAIN node that:
-1. Initializes MCP2515 over SPI on the MCU.
-2. Sends `ARM` to all configured robot nodes.
-3. Uploads NC/G-code to a slot via `UPLOAD_BEGIN/DATA/END`.
-4. Sends `PREPARE` to all robot nodes.
-5. Starts all robots in sync using broadcast `SYNC_START`.
-6. Periodically polls `GET_STATUS` from each node.
+Jednoduchy CAN master pro ESP32-C3. Po startu inicializuje CAN, spusti konzoli a umozni ovladat roboticke nody pres prikaz `can`.
 
-## Where to configure
-
-- Robot node IDs: `main/led_strip_rmt_ws2812_main.c` (`ROBOT_NODE_IDS`)
-- NC program text: `main/led_strip_rmt_ws2812_main.c` (`NC_PROGRAM`)
-- Program slot: `main/led_strip_rmt_ws2812_main.c` (`PROGRAM_SLOT`)
-- SPI pins, MCP2515 oscillator, CAN bitrate: `main/can_master.h`
-
-## Build and flash
+## Build / flash
 
 ```bash
 idf.py set-target esp32c3
 idf.py -p PORT build flash monitor
 ```
+
+Po pripojeni monitoru zadavej prikazy do konzole (`>>`).
+
+## Implementovane prikazy
+
+```text
+can init
+can probe
+can loopback
+can search [from] [to]
+can nodes
+can arm <node|all>
+can disarm <node|all>
+can home <node|all>
+can status <node|all>
+can prepare <node|all> <slot>
+can run <node|all> <slot>
+can delete <node|all> <slot>
+can upload <node|all> <slot>   (nahraje DEFAULT_NC)
+can stop
+can sync
+can seq [slot]
+```
+
+## Kratke priklady
+
+```text
+can search
+can arm all
+can upload all 0
+can prepare all 0
+can sync
+```
+
+## Kde co nastavit
+
+- SPI piny, MCP2515 oscilator, bitrate, timeouty: `main/can_master/can_master.h`
+- Nody pro `all` v konzoli: `main/cmd_control/cmd_control.c` (`CONFIGURED_NODE_IDS`)
+- Vychozi NC program pro `can upload`: `main/cmd_control/cmd_control.c` (`DEFAULT_NC`)
