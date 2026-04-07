@@ -195,7 +195,8 @@ void status_led_start(const uint8_t *node_ids, size_t node_count)
         return;
     }
 
-    rmt_copy_encoder_config_t encoder_cfg = {0};
+    rmt_copy_encoder_config_t encoder_cfg;
+    memset(&encoder_cfg, 0, sizeof(encoder_cfg));
     err = rmt_new_copy_encoder(&encoder_cfg, &s_copy_encoder);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "rmt_new_copy_encoder failed: %s", esp_err_to_name(err));

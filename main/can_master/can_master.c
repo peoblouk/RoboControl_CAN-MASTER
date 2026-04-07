@@ -18,9 +18,17 @@ static const char *TAG = "can_master";
 #define RX_TASK_STACK 4096
 #define RX_TASK_PRIO 8
 #define RX_POLL_MS 2
+#define RX_DRAIN_MAX_ITERS 32
 #define SPI_LOCK_MS 1000
 #define TX_WAIT_MS 50
 #define STATUS_CACHE_NODE_COUNT 128
+#define INFO_CACHE_NODE_COUNT 128
+#define INFO_MASK_WORK_OFFSET  (1U << 0)
+#define INFO_MASK_META         (1U << 1)
+#define INFO_MASK_VALUES_0_2   (1U << 2)
+#define INFO_MASK_VALUES_3_5   (1U << 3)
+#define INFO_MASK_SENSORS      (INFO_MASK_META | INFO_MASK_VALUES_0_2 | INFO_MASK_VALUES_3_5)
+#define CAN_FLAG_ARMED         (1U << 0)
 
 #define MCP_RESET 0xC0
 #define MCP_READ 0x03
@@ -86,6 +94,15 @@ typedef struct {
 } status_cache_entry_t;
 
 typedef struct {
+    uint8_t node_id;
+    bool valid;
+    TickType_t last_seen_tick;
+    uint8_t frame_mask;
+    can_master_work_offset_t work_offset;
+    can_master_sensor_values_t sensors;
+} info_cache_entry_t;
+
+typedef struct {
     uint8_t cnf1;
     uint8_t cnf2;
     uint8_t cnf3;
@@ -98,6 +115,20 @@ static QueueHandle_t s_resp_q = NULL;
 static TaskHandle_t s_rx_task = NULL;
 static status_cache_entry_t s_status[STATUS_CACHE_NODE_COUNT] = {0};
 static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
+static info_cache_entry_t s_info[INFO_CACHE_NODE_COUNT] = {0};
+static portMUX_TYPE s_info_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void IRAM_ATTR can_int_isr(void *arg)
+{
+    (void)arg;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (s_rx_task != NULL) {
+        vTaskNotifyGiveFromISR(s_rx_task, &higher_priority_task_woken);
+    }
+    if (higher_priority_task_woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 static const char *cmd_to_str(uint8_t cmd)
 {
@@ -135,6 +166,15 @@ const char *can_master_protocol_result_to_str(can_protocol_result_t code)
     }
 }
 
+const char *can_master_info_source_to_str(can_info_value_source_t source)
+{
+    switch (source) {
+        case CAN_INFO_SOURCE_EST_JOINTS: return "est_joints";
+        case CAN_INFO_SOURCE_ADC_SENSORS: return "adc_sensors";
+        default: return "unknown";
+    }
+}
+
 static bool node_valid(uint8_t node_id) { return node_id > 0 && node_id <= CAN_NODE_ID_MAX; }
 
 static bool is_response_id(uint32_t id, uint8_t *node)
@@ -149,6 +189,25 @@ static bool is_status_id(uint32_t id, uint8_t *node)
     if (id < CAN_STATUS_ID_BASE || id > (CAN_STATUS_ID_BASE + CAN_NODE_ID_MAX)) return false;
     if (node != NULL) *node = (uint8_t)(id - CAN_STATUS_ID_BASE);
     return true;
+}
+
+static bool is_info_id(uint32_t id, uint8_t *node)
+{
+    if (id < CAN_INFO_ID_BASE || id > (CAN_INFO_ID_BASE + CAN_NODE_ID_MAX)) return false;
+    if (node != NULL) *node = (uint8_t)(id - CAN_INFO_ID_BASE);
+    return true;
+}
+
+static uint32_t ticks_to_ms(TickType_t ticks)
+{
+    uint64_t ms = (uint64_t)ticks * (uint64_t)portTICK_PERIOD_MS;
+    return (ms > UINT32_MAX) ? UINT32_MAX : (uint32_t)ms;
+}
+
+static int16_t decode_i16_le(const uint8_t *data)
+{
+    if (data == NULL) return 0;
+    return (int16_t)(((uint16_t)data[1] << 8U) | (uint16_t)data[0]);
 }
 
 static bool lock_spi(void)
@@ -400,6 +459,88 @@ static void cache_status(const can_master_status_t *st)
     portEXIT_CRITICAL(&s_status_mux);
 }
 
+static void info_cache_reset(info_cache_entry_t *entry, uint8_t node_id)
+{
+    if (entry == NULL) return;
+
+    memset(entry, 0, sizeof(*entry));
+    entry->node_id = node_id;
+    entry->work_offset.node_id = node_id;
+    entry->sensors.node_id = node_id;
+    for (size_t i = 0; i < 3U; i++) {
+        entry->work_offset.work_offset_0p1mm[i] = CAN_INFO_VALUE_INVALID_I16;
+    }
+    for (size_t i = 0; i < 6U; i++) {
+        entry->sensors.values_0p1deg[i] = CAN_INFO_VALUE_INVALID_I16;
+    }
+}
+
+static void clear_info_cache(uint8_t node_id)
+{
+    if (!node_valid(node_id)) return;
+
+    portENTER_CRITICAL(&s_info_mux);
+    info_cache_reset(&s_info[node_id], node_id);
+    portEXIT_CRITICAL(&s_info_mux);
+}
+
+static void handle_info(uint8_t node, const mcp_frame_t *f)
+{
+    if (!node_valid(node) || f == NULL || f->dlc < 2U) return;
+
+    portENTER_CRITICAL(&s_info_mux);
+    info_cache_entry_t *entry = &s_info[node];
+    if (!entry->valid) {
+        info_cache_reset(entry, node);
+        entry->valid = true;
+    }
+
+    entry->last_seen_tick = xTaskGetTickCount();
+
+    switch ((can_info_frame_kind_t)f->data[0]) {
+        case CAN_INFO_WORK_OFFSET:
+            if (f->dlc >= 7U) {
+                entry->work_offset.work_offset_0p1mm[0] = decode_i16_le(&f->data[1]);
+                entry->work_offset.work_offset_0p1mm[1] = decode_i16_le(&f->data[3]);
+                entry->work_offset.work_offset_0p1mm[2] = decode_i16_le(&f->data[5]);
+                entry->frame_mask |= INFO_MASK_WORK_OFFSET;
+            }
+            break;
+
+        case CAN_INFO_TCP_META:
+            if (f->dlc >= 8U) {
+                entry->sensors.value_source = (can_info_value_source_t)f->data[4];
+                entry->sensors.value_count = f->data[5];
+                entry->frame_mask |= INFO_MASK_META;
+            }
+            break;
+
+        case CAN_INFO_VALUES_0_2:
+            if (f->dlc >= 8U) {
+                entry->sensors.values_0p1deg[0] = decode_i16_le(&f->data[1]);
+                entry->sensors.values_0p1deg[1] = decode_i16_le(&f->data[3]);
+                entry->sensors.values_0p1deg[2] = decode_i16_le(&f->data[5]);
+                entry->sensors.value_count = f->data[7];
+                entry->frame_mask |= INFO_MASK_VALUES_0_2;
+            }
+            break;
+
+        case CAN_INFO_VALUES_3_5:
+            if (f->dlc >= 8U) {
+                entry->sensors.values_0p1deg[3] = decode_i16_le(&f->data[1]);
+                entry->sensors.values_0p1deg[4] = decode_i16_le(&f->data[3]);
+                entry->sensors.values_0p1deg[5] = decode_i16_le(&f->data[5]);
+                entry->sensors.value_count = f->data[7];
+                entry->frame_mask |= INFO_MASK_VALUES_3_5;
+            }
+            break;
+
+        default:
+            break;
+    }
+    portEXIT_CRITICAL(&s_info_mux);
+}
+
 static void handle_status(uint8_t node, const mcp_frame_t *f)
 {
     if (f->dlc < 8U) return;
@@ -447,13 +588,69 @@ static void handle_frame(const mcp_frame_t *f)
         handle_status(node, f);
         return;
     }
+    if (is_info_id(f->id, &node)) {
+        handle_info(node, f);
+        return;
+    }
+}
+
+static void rx_drain_pending_locked(void)
+{
+    for (int iter = 0; iter < RX_DRAIN_MAX_ITERS; iter++) {
+        uint8_t intf = 0;
+        esp_err_t err = mcp_read_reg_locked(REG_CANINTF, &intf);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "RX drain read CANINTF failed: %s", esp_err_to_name(err));
+            return;
+        }
+
+        bool did_work = false;
+
+        if (intf & CANINTF_RX0IF) {
+            mcp_frame_t frame = {0};
+            if (mcp_read_frame_locked(false, &frame) == ESP_OK) {
+                handle_frame(&frame);
+            }
+            (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_RX0IF, 0x00);
+            did_work = true;
+        }
+
+        if (intf & CANINTF_RX1IF) {
+            mcp_frame_t frame = {0};
+            if (mcp_read_frame_locked(true, &frame) == ESP_OK) {
+                handle_frame(&frame);
+            }
+            (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_RX1IF, 0x00);
+            did_work = true;
+        }
+
+        if (intf & CANINTF_ERRIF) {
+            uint8_t eflg = 0;
+            (void)mcp_read_reg_locked(REG_EFLG, &eflg);
+            ESP_LOGW(TAG, "MCP2515 ERRIF eflg=0x%02X (TXBO=%u TXEP=%u RXEP=%u RXOVR=%u)",
+                     (unsigned)eflg,
+                     (unsigned)((eflg & EFLG_TXBO) != 0),
+                     (unsigned)((eflg & EFLG_TXEP) != 0),
+                     (unsigned)((eflg & EFLG_RXEP) != 0),
+                     (unsigned)((eflg & (EFLG_RX0OVR | EFLG_RX1OVR)) != 0));
+            (void)mcp_bit_modify_locked(REG_EFLG, (EFLG_RX0OVR | EFLG_RX1OVR), 0x00);
+            (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_ERRIF, 0x00);
+            did_work = true;
+        }
+
+        if (!did_work) {
+            return;
+        }
+    }
+
+    ESP_LOGW(TAG, "RX drain reached iteration limit");
 }
 
 static void rx_task(void *arg)
 {
     (void)arg;
-    const TickType_t poll_delay_ticks = pdMS_TO_TICKS(RX_POLL_MS);
-    const TickType_t poll_delay = (poll_delay_ticks > 0) ? poll_delay_ticks : 1;
+    const TickType_t wait_ticks = pdMS_TO_TICKS(RX_POLL_MS);
+    const TickType_t wait_timeout = (wait_ticks > 0) ? wait_ticks : 1;
 
     for (;;) {
         if (!s_ready) {
@@ -461,39 +658,18 @@ static void rx_task(void *arg)
             continue;
         }
 
-        mcp_frame_t frames[2] = {0};
-        size_t n = 0;
-
-        if (lock_spi()) {
-            uint8_t intf = 0;
-            esp_err_t err = mcp_read_reg_locked(REG_CANINTF, &intf);
-            if (err == ESP_OK) {
-                if (intf & CANINTF_RX0IF) {
-                    if (mcp_read_frame_locked(false, &frames[n]) == ESP_OK) n++;
-                    (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_RX0IF, 0x00);
-                }
-                if (intf & CANINTF_RX1IF) {
-                    if (mcp_read_frame_locked(true, &frames[n]) == ESP_OK) n++;
-                    (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_RX1IF, 0x00);
-                }
-                if (intf & CANINTF_ERRIF) {
-                    uint8_t eflg = 0;
-                    (void)mcp_read_reg_locked(REG_EFLG, &eflg);
-                    ESP_LOGW(TAG, "MCP2515 ERRIF eflg=0x%02X (TXBO=%u TXEP=%u RXEP=%u RXOVR=%u)",
-                             (unsigned)eflg,
-                             (unsigned)((eflg & EFLG_TXBO) != 0),
-                             (unsigned)((eflg & EFLG_TXEP) != 0),
-                             (unsigned)((eflg & EFLG_RXEP) != 0),
-                             (unsigned)((eflg & (EFLG_RX0OVR | EFLG_RX1OVR)) != 0));
-                    (void)mcp_bit_modify_locked(REG_EFLG, (EFLG_RX0OVR | EFLG_RX1OVR), 0x00);
-                    (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_ERRIF, 0x00);
-                }
+        bool should_service = (gpio_get_level(CAN_MASTER_INT_GPIO) == 0);
+        if (!should_service) {
+            should_service = (ulTaskNotifyTake(pdTRUE, wait_timeout) > 0U);
+            if (!should_service) {
+                should_service = (gpio_get_level(CAN_MASTER_INT_GPIO) == 0);
             }
-            unlock_spi();
         }
 
-        for (size_t i = 0; i < n; i++) handle_frame(&frames[i]);
-        vTaskDelay(poll_delay);
+        if (!should_service) continue;
+        if (!lock_spi()) continue;
+        rx_drain_pending_locked();
+        unlock_spi();
     }
 }
 
@@ -620,7 +796,7 @@ esp_err_t can_master_init(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
     };
     err = gpio_config(&int_cfg);
     if (err != ESP_OK) {
@@ -654,6 +830,22 @@ esp_err_t can_master_init(void)
             ESP_LOGE(TAG, "Unable to create RX task");
             return ESP_FAIL;
         }
+    }
+
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = gpio_isr_handler_add(CAN_MASTER_INT_GPIO, can_int_isr, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gpio_isr_handler_add failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = gpio_intr_enable(CAN_MASTER_INT_GPIO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "gpio_intr_enable failed: %s", esp_err_to_name(err));
+        return err;
     }
 
     s_ready = true;
@@ -707,13 +899,14 @@ esp_err_t can_master_program_delete(uint8_t node_id, uint8_t slot, can_master_re
 
 esp_err_t can_master_request_status(uint8_t node_id, can_master_response_t *out, uint32_t timeout_ms)
 {
+    clear_info_cache(node_id);
     return send_and_wait(node_id, CAN_CMD_GET_STATUS, NULL, 0, out, timeout_ms);
 }
 
 esp_err_t can_master_stop_all(void) { return send_cmd_broadcast(CAN_CMD_STOP, NULL, 0); }
 esp_err_t can_master_sync_start_all(void) { return send_cmd_broadcast(CAN_CMD_SYNC_START, NULL, 0); }
 
-esp_err_t can_master_upload_nc_program(uint8_t node_id, uint8_t slot, const uint8_t *program_bytes, size_t size_bytes, uint32_t timeout_ms)
+esp_err_t can_master_upload_gcode_program(uint8_t node_id, uint8_t slot, const uint8_t *program_bytes, size_t size_bytes, uint32_t timeout_ms)
 {
     if (program_bytes == NULL || size_bytes == 0 || size_bytes > 0xFFFFU) return ESP_ERR_INVALID_ARG;
     if (slot >= CAN_PROGRAM_SLOT_COUNT) return ESP_ERR_INVALID_ARG;
@@ -759,6 +952,11 @@ esp_err_t can_master_upload_nc_program(uint8_t node_id, uint8_t slot, const uint
     return ESP_OK;
 }
 
+esp_err_t can_master_upload_nc_program(uint8_t node_id, uint8_t slot, const uint8_t *program_bytes, size_t size_bytes, uint32_t timeout_ms)
+{
+    return can_master_upload_gcode_program(node_id, slot, program_bytes, size_bytes, timeout_ms);
+}
+
 esp_err_t can_master_get_last_status(uint8_t node_id, can_master_status_t *out)
 {
     if (out == NULL || !node_valid(node_id)) return ESP_ERR_INVALID_ARG;
@@ -771,6 +969,53 @@ esp_err_t can_master_get_last_status(uint8_t node_id, can_master_status_t *out)
     }
     portEXIT_CRITICAL(&s_status_mux);
     return err;
+}
+
+esp_err_t can_master_wait_work_offset(uint8_t node_id, can_master_work_offset_t *out_work_offset, uint32_t timeout_ms)
+{
+    if (out_work_offset == NULL || !node_valid(node_id)) return ESP_ERR_INVALID_ARG;
+
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    const TickType_t start = xTaskGetTickCount();
+
+    for (;;) {
+        TickType_t current = xTaskGetTickCount();
+        if ((current - start) >= timeout_ticks) return ESP_ERR_TIMEOUT;
+
+        portENTER_CRITICAL(&s_info_mux);
+        if (s_info[node_id].valid && ((s_info[node_id].frame_mask & INFO_MASK_WORK_OFFSET) != 0U)) {
+            *out_work_offset = s_info[node_id].work_offset;
+            out_work_offset->age_ms = ticks_to_ms(current - s_info[node_id].last_seen_tick);
+            portEXIT_CRITICAL(&s_info_mux);
+            return ESP_OK;
+        }
+        portEXIT_CRITICAL(&s_info_mux);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+esp_err_t can_master_wait_sensor_values(uint8_t node_id, can_master_sensor_values_t *out_sensor_values, uint32_t timeout_ms)
+{
+    if (out_sensor_values == NULL || !node_valid(node_id)) return ESP_ERR_INVALID_ARG;
+
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    const TickType_t start = xTaskGetTickCount();
+
+    for (;;) {
+        TickType_t now = xTaskGetTickCount();
+        if ((now - start) >= timeout_ticks) return ESP_ERR_TIMEOUT;
+
+        portENTER_CRITICAL(&s_info_mux);
+        if (s_info[node_id].valid && ((s_info[node_id].frame_mask & INFO_MASK_SENSORS) == INFO_MASK_SENSORS)) {
+            *out_sensor_values = s_info[node_id].sensors;
+            out_sensor_values->age_ms = ticks_to_ms(now - s_info[node_id].last_seen_tick);
+            portEXIT_CRITICAL(&s_info_mux);
+            return ESP_OK;
+        }
+        portEXIT_CRITICAL(&s_info_mux);
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 }
 
 bool can_master_node_is_online(uint8_t node_id, uint32_t max_age_ms)

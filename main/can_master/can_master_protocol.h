@@ -9,6 +9,7 @@
 #define CAN_CMD_ID_BROADCAST        0x17FU
 #define CAN_RESP_ID_BASE            0x180U
 #define CAN_STATUS_ID_BASE          0x700U
+#define CAN_INFO_ID_BASE            0x780U
 
 #define CAN_NODE_ID_MAX             0x7FU
 #define CAN_PROGRAM_SLOT_COUNT      4U
@@ -27,6 +28,21 @@ typedef enum {
     CAN_CMD_PREPARE = 0x20,
     CAN_CMD_SYNC_START = 0x21,
 } can_command_id_t;
+
+typedef enum {
+    CAN_INFO_WORK_OFFSET = 0x01,
+    CAN_INFO_TCP_WORK_XYZ = 0x02,
+    CAN_INFO_TCP_META = 0x03,
+    CAN_INFO_VALUES_0_2 = 0x10,
+    CAN_INFO_VALUES_3_5 = 0x11,
+} can_info_frame_kind_t;
+
+typedef enum {
+    CAN_INFO_SOURCE_EST_JOINTS = 0x00,
+    CAN_INFO_SOURCE_ADC_SENSORS = 0x01,
+} can_info_value_source_t;
+
+#define CAN_INFO_VALUE_INVALID_I16 ((int16_t)0x7FFF)
 
 typedef enum {
     CAN_PROTO_OK = 0x00,
