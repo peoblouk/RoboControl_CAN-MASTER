@@ -9,6 +9,7 @@
 #include "esp_console.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/task.h"
 #include "linenoise/linenoise.h"
 #include "sdkconfig.h"
 
@@ -17,6 +18,31 @@ static esp_console_repl_t *s_repl = NULL;
 static const uint8_t CONFIGURED_NODE_IDS[] = {CAN_MASTER_NODE1_ID, CAN_MASTER_NODE2_ID};
 #define CONFIGURED_NODE_COUNT (sizeof(CONFIGURED_NODE_IDS) / sizeof(CONFIGURED_NODE_IDS[0]))
 #define CAN_STATE_FLAG_ARMED (1U << 0)
+#define CAN_STATE_FLAG_REFERENCED (1U << 2)
+#define CAN_STATE_FLAG_TCP_EST (1U << 3)
+#define CAN_STATE_FLAG_PROGRAM_RUNNING (1U << 6)
+#define CAN_STATE_FLAG_ERROR (1U << 7)
+
+#define ROBOT_STATE_DISARMED 0U
+#define ROBOT_STATE_UNREFERENCED 1U
+#define ROBOT_STATE_READY 2U
+#define ROBOT_STATE_RUNNING 3U
+#define ROBOT_STATE_READY_FOR_SYNC 4U
+#define ROBOT_STATE_ERROR 5U
+
+#define CAN_SLOT_NONE 0xFFU
+
+#define RELAY_STATUS_POLL_MS 100U
+#define RELAY_READY_GRACE_MS 1200U
+#define RELAY_READY_TIMEOUT_MS 120000U
+#define RELAY_HOME_SETTLE_TIMEOUT_MS 120000U
+#define RELAY_TASK_STACK_SIZE 6144U
+#define RELAY_TASK_PRIORITY 5U
+
+#define RELAY_NODE1_FORWARD_SLOT 0U
+#define RELAY_NODE2_FORWARD_SLOT 0U
+#define RELAY_NODE2_RETURN_SLOT 1U
+#define RELAY_NODE1_RETURN_SLOT 1U
 
 static const char DEFAULT_GCODE[] =
     "G90\n"
@@ -25,6 +51,28 @@ static const char DEFAULT_GCODE[] =
     "G1 X145 Y35 Z70 F1200\n"
     "G1 X130 Y35 Z80 F1200\n"
     "M30\n";
+
+typedef struct {
+    uint8_t node_id;
+    uint8_t slot;
+    const char *label;
+} relay_step_t;
+
+static TaskHandle_t s_relay_task = NULL;
+static volatile bool s_relay_running = false;
+static volatile bool s_relay_stop_requested = false;
+static volatile uint32_t s_relay_target_cycles = 0;
+static volatile uint32_t s_relay_active_cycle = 0;
+static portMUX_TYPE s_relay_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void print_response_line(const can_master_response_t *resp);
+static bool relay_is_running(void);
+static bool relay_stop_requested(void);
+static void relay_request_stop(void);
+static void relay_set_cycle_progress(uint32_t active_cycle);
+static void relay_get_progress(uint32_t *out_active_cycle, uint32_t *out_target_cycles);
+static esp_err_t relay_execute_cycles(uint32_t cycles);
+static void relay_task(void *arg);
 
 static bool parse_slot_arg(const char *arg, uint8_t *out_slot)
 {
@@ -39,6 +87,22 @@ static bool parse_slot_arg(const char *arg, uint8_t *out_slot)
     }
 
     *out_slot = (uint8_t)parsed_slot;
+    return true;
+}
+
+static bool parse_cycle_count_arg(const char *arg, uint32_t *out_cycles)
+{
+    if (arg == NULL || out_cycles == NULL) {
+        return false;
+    }
+
+    char *end = NULL;
+    unsigned long parsed_cycles = strtoul(arg, &end, 0);
+    if (end == arg || *end != '\0' || parsed_cycles == 0UL || parsed_cycles > 100000UL) {
+        return false;
+    }
+
+    *out_cycles = (uint32_t)parsed_cycles;
     return true;
 }
 
@@ -122,6 +186,305 @@ static bool parse_node_or_all(const char *arg, uint8_t *out_node, bool *out_all)
     *out_all = false;
     *out_node = (uint8_t)parsed;
     return true;
+}
+
+static const char *robot_state_to_str(uint8_t state)
+{
+    switch (state) {
+        case ROBOT_STATE_DISARMED: return "DISARMED";
+        case ROBOT_STATE_UNREFERENCED: return "UNREFERENCED";
+        case ROBOT_STATE_READY: return "READY";
+        case ROBOT_STATE_RUNNING: return "RUNNING";
+        case ROBOT_STATE_READY_FOR_SYNC: return "READY_FOR_SYNC";
+        case ROBOT_STATE_ERROR: return "ERROR";
+        default: return "UNKNOWN";
+    }
+}
+
+static void print_status_snapshot(const can_master_status_t *status)
+{
+    if (status == NULL) {
+        return;
+    }
+
+    printf("node=%u state=%s(%u) flags=0x%02X prepared_slot=%u active_slot=%u proto_err=%s robot_err=%u\n",
+           (unsigned)status->node_id,
+           robot_state_to_str(status->robot_state),
+           (unsigned)status->robot_state,
+           (unsigned)status->state_flags,
+           (unsigned)status->prepared_slot,
+           (unsigned)status->active_slot,
+           can_master_protocol_result_to_str(status->last_protocol_error),
+           (unsigned)status->last_robot_error);
+}
+
+static esp_err_t request_and_read_status(uint8_t node_id, can_master_status_t *out_status)
+{
+    if (out_status == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    can_master_clear_pending_responses();
+
+    can_master_response_t resp = {0};
+    esp_err_t err = can_master_request_status(node_id, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (int attempt = 0; attempt < 10; attempt++) {
+        err = can_master_get_last_status(node_id, out_status);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    return err;
+}
+
+static bool relay_is_running(void)
+{
+    bool running = false;
+    taskENTER_CRITICAL(&s_relay_mux);
+    running = s_relay_running;
+    taskEXIT_CRITICAL(&s_relay_mux);
+    return running;
+}
+
+static bool relay_stop_requested(void)
+{
+    bool stop_requested = false;
+    taskENTER_CRITICAL(&s_relay_mux);
+    stop_requested = s_relay_stop_requested;
+    taskEXIT_CRITICAL(&s_relay_mux);
+    return stop_requested;
+}
+
+static void relay_request_stop(void)
+{
+    taskENTER_CRITICAL(&s_relay_mux);
+    s_relay_stop_requested = true;
+    taskEXIT_CRITICAL(&s_relay_mux);
+}
+
+static void relay_set_cycle_progress(uint32_t active_cycle)
+{
+    taskENTER_CRITICAL(&s_relay_mux);
+    s_relay_active_cycle = active_cycle;
+    taskEXIT_CRITICAL(&s_relay_mux);
+}
+
+static void relay_get_progress(uint32_t *out_active_cycle, uint32_t *out_target_cycles)
+{
+    taskENTER_CRITICAL(&s_relay_mux);
+    if (out_active_cycle != NULL) {
+        *out_active_cycle = s_relay_active_cycle;
+    }
+    if (out_target_cycles != NULL) {
+        *out_target_cycles = s_relay_target_cycles;
+    }
+    taskEXIT_CRITICAL(&s_relay_mux);
+}
+
+static esp_err_t read_cached_status(uint8_t node_id, can_master_status_t *out_status)
+{
+    if (out_status == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!can_master_node_is_online(node_id, CAN_MASTER_NODE_ONLINE_TIMEOUT_MS)) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return can_master_get_last_status(node_id, out_status);
+}
+
+static bool status_is_ready_for_program(const can_master_status_t *status)
+{
+    if (status == NULL) {
+        return false;
+    }
+
+    return status->robot_state == ROBOT_STATE_READY &&
+           status->active_slot == CAN_SLOT_NONE &&
+           (status->state_flags & CAN_STATE_FLAG_ARMED) != 0U &&
+           (status->state_flags & CAN_STATE_FLAG_REFERENCED) != 0U &&
+           (status->state_flags & CAN_STATE_FLAG_TCP_EST) != 0U &&
+           (status->state_flags & CAN_STATE_FLAG_PROGRAM_RUNNING) == 0U &&
+           (status->state_flags & CAN_STATE_FLAG_ERROR) == 0U;
+}
+
+static bool status_is_running_expected_slot(const can_master_status_t *status, uint8_t slot)
+{
+    if (status == NULL) {
+        return false;
+    }
+
+    return status->robot_state == ROBOT_STATE_RUNNING ||
+           (status->state_flags & CAN_STATE_FLAG_PROGRAM_RUNNING) != 0U ||
+           status->active_slot == slot;
+}
+
+static esp_err_t wait_for_node_ready(uint8_t node_id, uint8_t expected_slot, uint32_t timeout_ms)
+{
+    const TickType_t start_tick = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    bool saw_running = false;
+    esp_err_t last_err = ESP_OK;
+
+    for (;;) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - start_tick) >= timeout_ticks) {
+            return (last_err != ESP_OK) ? last_err : ESP_ERR_TIMEOUT;
+        }
+
+        if (relay_stop_requested()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        can_master_status_t status = {0};
+        last_err = read_cached_status(node_id, &status);
+        if (last_err != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(RELAY_STATUS_POLL_MS));
+            continue;
+        }
+
+        if (status.robot_state == ROBOT_STATE_ERROR || (status.state_flags & CAN_STATE_FLAG_ERROR) != 0U) {
+            print_status_snapshot(&status);
+            return ESP_FAIL;
+        }
+
+        if (expected_slot != CAN_SLOT_NONE && status_is_running_expected_slot(&status, expected_slot)) {
+            saw_running = true;
+        }
+
+        const uint32_t elapsed_ms = (uint32_t)pdTICKS_TO_MS(now - start_tick);
+        if (status_is_ready_for_program(&status) &&
+            (saw_running || elapsed_ms >= RELAY_READY_GRACE_MS)) {
+            return ESP_OK;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(RELAY_STATUS_POLL_MS));
+    }
+}
+
+static esp_err_t relay_arm_and_home_node(uint8_t node_id)
+{
+    can_master_response_t resp = {0};
+
+    if (relay_stop_requested()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    can_master_clear_pending_responses();
+    esp_err_t err = can_master_arm(node_id, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        if (resp.node_id != 0U) print_response_line(&resp);
+        printf("ERR: node=%u arm failed (%s)\n", (unsigned)node_id, esp_err_to_name(err));
+        return err;
+    }
+    print_response_line(&resp);
+
+    if (relay_stop_requested()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    can_master_clear_pending_responses();
+    err = can_master_home(node_id, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        if (resp.node_id != 0U) print_response_line(&resp);
+        printf("ERR: node=%u home failed (%s)\n", (unsigned)node_id, esp_err_to_name(err));
+        return err;
+    }
+    print_response_line(&resp);
+
+    err = wait_for_node_ready(node_id, CAN_SLOT_NONE, RELAY_HOME_SETTLE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        printf("ERR: node=%u did not become READY after home (%s)\n", (unsigned)node_id, esp_err_to_name(err));
+        return err;
+    }
+
+    printf("OK: node=%u referenced and ready\n", (unsigned)node_id);
+    return ESP_OK;
+}
+
+static esp_err_t relay_broadcast_home_all(void)
+{
+    if (relay_stop_requested()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    can_master_clear_pending_responses();
+    printf("RELAY: broadcast HOME to both nodes\n");
+    esp_err_t err = can_master_home_broadcast_all();
+    if (err != ESP_OK) {
+        printf("ERR: broadcast HOME failed (%s)\n", esp_err_to_name(err));
+        return err;
+    }
+
+    err = wait_for_node_ready(CAN_MASTER_NODE1_ID, CAN_SLOT_NONE, RELAY_HOME_SETTLE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        printf("ERR: node=%u broadcast HOME did not finish cleanly (%s)\n",
+               (unsigned)CAN_MASTER_NODE1_ID,
+               esp_err_to_name(err));
+        return err;
+    }
+
+    err = wait_for_node_ready(CAN_MASTER_NODE2_ID, CAN_SLOT_NONE, RELAY_HOME_SETTLE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        printf("ERR: node=%u broadcast HOME did not finish cleanly (%s)\n",
+               (unsigned)CAN_MASTER_NODE2_ID,
+               esp_err_to_name(err));
+        return err;
+    }
+
+    printf("OK: synchronized HOME reference finished on both nodes\n");
+    return ESP_OK;
+}
+
+static esp_err_t relay_run_step(const relay_step_t *step)
+{
+    if (step == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    can_master_response_t resp = {0};
+    printf("RELAY: run node=%u slot=%u (%s)\n",
+           (unsigned)step->node_id,
+           (unsigned)step->slot,
+           step->label);
+
+    if (relay_stop_requested()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    can_master_clear_pending_responses();
+    esp_err_t err = can_master_program_run(step->node_id, step->slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        if (resp.node_id != 0U) print_response_line(&resp);
+        printf("ERR: node=%u slot=%u run failed (%s)\n",
+               (unsigned)step->node_id,
+               (unsigned)step->slot,
+               esp_err_to_name(err));
+        return err;
+    }
+    print_response_line(&resp);
+
+    err = wait_for_node_ready(step->node_id, step->slot, RELAY_READY_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        printf("ERR: node=%u slot=%u did not finish cleanly (%s)\n",
+               (unsigned)step->node_id,
+               (unsigned)step->slot,
+               esp_err_to_name(err));
+        return err;
+    }
+
+    printf("OK: node=%u slot=%u finished (%s)\n",
+           (unsigned)step->node_id,
+           (unsigned)step->slot,
+           step->label);
+    return ESP_OK;
 }
 
 static void print_configured_nodes(void)
@@ -544,6 +907,157 @@ static int cmd_can_seq(int argc, char **argv)
     return 0;
 }
 
+static esp_err_t relay_execute_cycles(uint32_t cycles)
+{
+    static const relay_step_t relay_steps[] = {
+        { CAN_MASTER_NODE2_ID, RELAY_NODE2_FORWARD_SLOT, "node2 slot0: HOME -> pick A -> place B -> HOME" },
+        { CAN_MASTER_NODE1_ID, RELAY_NODE1_FORWARD_SLOT, "node1 slot0: HOME -> pick B -> place C -> HOME" },
+        { CAN_MASTER_NODE1_ID, RELAY_NODE1_RETURN_SLOT, "node1 slot1: pick C -> place B -> HOME" },
+        { CAN_MASTER_NODE2_ID, RELAY_NODE2_RETURN_SLOT, "node2 slot1: pick B -> place A -> HOME" },
+    };
+
+    printf("RELAY: arm + home node=%u\n", (unsigned)CAN_MASTER_NODE1_ID);
+    esp_err_t err = relay_arm_and_home_node(CAN_MASTER_NODE1_ID);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    printf("RELAY: arm + home node=%u\n", (unsigned)CAN_MASTER_NODE2_ID);
+    err = relay_arm_and_home_node(CAN_MASTER_NODE2_ID);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = relay_broadcast_home_all();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (uint32_t cycle = 0; cycle < cycles; cycle++) {
+        if (relay_stop_requested()) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        relay_set_cycle_progress(cycle + 1U);
+        printf("RELAY: cycle %" PRIu32 "/%" PRIu32 "\n", cycle + 1U, cycles);
+        for (size_t i = 0; i < sizeof(relay_steps) / sizeof(relay_steps[0]); i++) {
+            err = relay_run_step(&relay_steps[i]);
+            if (err != ESP_OK) {
+                return relay_stop_requested() ? ESP_ERR_INVALID_STATE : err;
+            }
+        }
+    }
+
+    printf("OK: relay orchestrator finished %" PRIu32 " cycle(s)\n", cycles);
+    return ESP_OK;
+}
+
+static void relay_task(void *arg)
+{
+    const uint32_t cycles = (uint32_t)(uintptr_t)arg;
+    const esp_err_t err = relay_execute_cycles(cycles);
+
+    if (err == ESP_ERR_INVALID_STATE && relay_stop_requested()) {
+        printf("RELAY: stopped\n");
+    } else if (err != ESP_OK) {
+        printf("ERR: relay aborted (%s)\n", esp_err_to_name(err));
+    }
+
+    taskENTER_CRITICAL(&s_relay_mux);
+    s_relay_running = false;
+    s_relay_stop_requested = false;
+    s_relay_target_cycles = 0;
+    s_relay_active_cycle = 0;
+    s_relay_task = NULL;
+    taskEXIT_CRITICAL(&s_relay_mux);
+
+    vTaskDelete(NULL);
+}
+
+static int cmd_can_relay_status(void)
+{
+    if (!relay_is_running()) {
+        printf("RELAY: idle\n");
+        return 0;
+    }
+
+    uint32_t active_cycle = 0;
+    uint32_t target_cycles = 0;
+    relay_get_progress(&active_cycle, &target_cycles);
+    printf("RELAY: running cycle=%" PRIu32 "/%" PRIu32 "%s\n",
+           active_cycle,
+           target_cycles,
+           relay_stop_requested() ? " stop_requested=yes" : "");
+    return 0;
+}
+
+static int cmd_can_relay(int argc, char **argv)
+{
+    if (argc == 3 && strcmp(argv[2], "status") == 0) {
+        return cmd_can_relay_status();
+    }
+
+    if (argc == 3 && strcmp(argv[2], "stop") == 0) {
+        if (!relay_is_running()) {
+            printf("RELAY: idle\n");
+            return 0;
+        }
+
+        relay_request_stop();
+        can_master_clear_pending_responses();
+        esp_err_t err = can_master_stop_all();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_master_clear_pending_responses();
+        printf(err == ESP_OK ? "OK: relay stop requested\n" : "ERR: relay stop failed\n");
+        return 0;
+    }
+
+    uint32_t cycles = 1;
+    if (argc == 3 && !parse_cycle_count_arg(argv[2], &cycles)) {
+        printf("ERR: invalid cycle count\n");
+        return 0;
+    }
+
+    if (relay_is_running()) {
+        printf("ERR: relay is already running\n");
+        return 0;
+    }
+
+    taskENTER_CRITICAL(&s_relay_mux);
+    s_relay_running = true;
+    s_relay_stop_requested = false;
+    s_relay_target_cycles = cycles;
+    s_relay_active_cycle = 0;
+    s_relay_task = NULL;
+    taskEXIT_CRITICAL(&s_relay_mux);
+
+    TaskHandle_t relay_task_handle = NULL;
+    BaseType_t created = xTaskCreate(relay_task,
+                                     "relay_task",
+                                     RELAY_TASK_STACK_SIZE,
+                                     (void *)(uintptr_t)cycles,
+                                     RELAY_TASK_PRIORITY,
+                                     &relay_task_handle);
+    if (created != pdPASS) {
+        taskENTER_CRITICAL(&s_relay_mux);
+        s_relay_running = false;
+        s_relay_stop_requested = false;
+        s_relay_target_cycles = 0;
+        s_relay_active_cycle = 0;
+        s_relay_task = NULL;
+        taskEXIT_CRITICAL(&s_relay_mux);
+        printf("ERR: relay task start failed\n");
+        return 0;
+    }
+
+    taskENTER_CRITICAL(&s_relay_mux);
+    s_relay_task = relay_task_handle;
+    taskEXIT_CRITICAL(&s_relay_mux);
+
+    printf("OK: relay started (%" PRIu32 " cycle(s)); use `can relay status` or `can stop`\n", cycles);
+    return 0;
+}
+
 static int cmd_can(int argc, char **argv)
 {
     if (argc < 2) {
@@ -563,6 +1077,43 @@ static int cmd_can(int argc, char **argv)
         printf("  can upload <node|all> <slot>   (uploads DEFAULT_GCODE)\n");
         printf("  can upload_file <node|all> <slot> <path>   (loads /spiffs/<path>)\n");
         printf("  can seq [slot]\n");
+        printf("  can relay [cycles]\n");
+        printf("  can relay status\n");
+        printf("  can relay stop\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "nodes") == 0) {
+        return cmd_can_nodes();
+    }
+
+    if (strcmp(argv[1], "stop") == 0) {
+        if (relay_is_running()) {
+            relay_request_stop();
+        }
+
+        can_master_clear_pending_responses();
+        esp_err_t err = can_master_stop_all();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_master_clear_pending_responses();
+        printf(err == ESP_OK
+                   ? (relay_is_running() ? "OK: stop sent, relay stop requested\n" : "OK: stop sent\n")
+                   : "ERR: stop failed\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "relay") == 0) {
+        if (argc != 2 && argc != 3) {
+            printf("Usage: can relay [cycles]\n");
+            printf("       can relay status\n");
+            printf("       can relay stop\n");
+            return 0;
+        }
+        return cmd_can_relay(argc, argv);
+    }
+
+    if (relay_is_running()) {
+        printf("ERR: relay is running; use `can relay status` or `can stop`\n");
         return 0;
     }
 
@@ -573,16 +1124,6 @@ static int cmd_can(int argc, char **argv)
         } else {
             printf("ERR: can init failed (%s)\n", esp_err_to_name(err));
         }
-        return 0;
-    }
-
-    if (strcmp(argv[1], "nodes") == 0) {
-        return cmd_can_nodes();
-    }
-
-    if (strcmp(argv[1], "stop") == 0) {
-        esp_err_t err = can_master_stop_all();
-        printf(err == ESP_OK ? "OK: stop sent\n" : "ERR: stop failed\n");
         return 0;
     }
 

@@ -864,6 +864,15 @@ esp_err_t can_master_init(void)
 
 bool can_master_is_ready(void) { return s_ready; }
 
+void can_master_clear_pending_responses(void)
+{
+    if (s_resp_q == NULL) return;
+
+    can_master_response_t discarded = {0};
+    while (xQueueReceive(s_resp_q, &discarded, 0) == pdTRUE) {
+    }
+}
+
 esp_err_t can_master_arm(uint8_t node_id, can_master_response_t *out, uint32_t timeout_ms)
 {
     return send_and_wait(node_id, CAN_CMD_ARM, NULL, 0, out, timeout_ms);
@@ -877,6 +886,11 @@ esp_err_t can_master_disarm(uint8_t node_id, can_master_response_t *out, uint32_
 esp_err_t can_master_home(uint8_t node_id, can_master_response_t *out, uint32_t timeout_ms)
 {
     return send_and_wait(node_id, CAN_CMD_HOME, NULL, 0, out, timeout_ms);
+}
+
+esp_err_t can_master_home_broadcast_all(void)
+{
+    return send_cmd_broadcast(CAN_CMD_HOME, NULL, 0);
 }
 
 esp_err_t can_master_prepare_slot(uint8_t node_id, uint8_t slot, can_master_response_t *out, uint32_t timeout_ms)

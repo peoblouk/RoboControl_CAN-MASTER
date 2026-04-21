@@ -95,12 +95,14 @@ bool can_master_is_ready(void);
 esp_err_t can_master_arm(uint8_t node_id, can_master_response_t *out_response, uint32_t timeout_ms);
 esp_err_t can_master_disarm(uint8_t node_id, can_master_response_t *out_response, uint32_t timeout_ms);
 esp_err_t can_master_home(uint8_t node_id, can_master_response_t *out_response, uint32_t timeout_ms);
+esp_err_t can_master_home_broadcast_all(void);
 esp_err_t can_master_prepare_slot(uint8_t node_id, uint8_t slot, can_master_response_t *out_response, uint32_t timeout_ms);
 esp_err_t can_master_program_run(uint8_t node_id, uint8_t slot, can_master_response_t *out_response, uint32_t timeout_ms);
 esp_err_t can_master_program_delete(uint8_t node_id, uint8_t slot, can_master_response_t *out_response, uint32_t timeout_ms);
 esp_err_t can_master_request_status(uint8_t node_id, can_master_response_t *out_response, uint32_t timeout_ms);
 esp_err_t can_master_stop_all(void);
 esp_err_t can_master_sync_start_all(void);
+void can_master_clear_pending_responses(void);
 
 esp_err_t can_master_upload_gcode_program(uint8_t node_id,
                                           uint8_t slot,
