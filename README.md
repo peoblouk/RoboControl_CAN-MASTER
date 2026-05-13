@@ -23,11 +23,13 @@ can status <node|all>
 can sensors <node|all>
 can prepare <node|all> <slot>
 can run <node|all> <slot>
+can run_sync all <path> [slot]   (nahraje /spiffs/<path>, pripravi all a posle sync)
 can delete <node|all> <slot>
 can upload <node|all> <slot>   (nahraje DEFAULT_GCODE)
 can upload_file <node|all> <slot> <path>   (nahraje /spiffs/<path>)
 can stop
 can sync
+can measure_sync [duration_ms]
 can seq [slot]
 can relay [cycles]
 can relay status
@@ -38,12 +40,57 @@ can relay stop
 
 ```text
 can arm all
-can upload all 0
-can prepare all 0
-can sync
+can run_sync all example.gcode
+can measure_sync
 can upload_file all 0 example.gcode
 can sensors all
 ```
+
+Pro synchronizovany start programu ze SPIFFS staci:
+
+```text
+can home all
+can run_sync all example.gcode
+```
+
+`run_sync` pouzije slot 0, pokud slot nezadas. Jiny slot napr.:
+
+```text
+can run_sync all example.gcode 1
+```
+
+## Mereni synchronizace start/stop
+
+Pro mereni odezvy uzlu na `SYNC_START` staci jeden prikaz:
+
+```text
+can measure_sync
+```
+
+Prikaz automaticky:
+
+1. zastavi pripadny beh,
+2. zapne serva pres broadcast `ARM`,
+3. nahraje merici program do slotu 3 na obou uzlech,
+4. pripravi oba uzly pres `PREPARE`,
+5. posle broadcast `SYNC_START`,
+6. po 2 ms posle broadcast `DISARM`.
+
+Pozor: slot 3 je pri mereni prepsan. Pro presne mereni pouzij debug GPIO12 na obou slave uzlech, ne servo PWM. Delku behu lze zmenit napr. na 10 ms:
+
+```text
+can measure_sync 10
+```
+
+Na osciloskopu sleduj debug vystup na obou slave uzlech:
+
+```text
+CH1 = node1 GPIO12 debug
+CH2 = node2 GPIO12 debug
+GND = spolecna zem robotu
+```
+
+GPIO12 jde do `HIGH`, kdyz slave skutecne zacne vykonavat merici program po `SYNC_START`, a do `LOW`, kdyz prijde `DISARM`. Rozdil nabeznych hran je rozdil startu uzlu; rozdil sestupnych hran je rozdil ukonceni.
 
 ## Relay orchestrator
 

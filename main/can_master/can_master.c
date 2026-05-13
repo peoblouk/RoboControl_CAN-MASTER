@@ -883,6 +883,9 @@ esp_err_t can_master_disarm(uint8_t node_id, can_master_response_t *out, uint32_
     return send_and_wait(node_id, CAN_CMD_DISARM, NULL, 0, out, timeout_ms);
 }
 
+esp_err_t can_master_arm_all(void) { return send_cmd_broadcast(CAN_CMD_ARM, NULL, 0); }
+esp_err_t can_master_disarm_all(void) { return send_cmd_broadcast(CAN_CMD_DISARM, NULL, 0); }
+
 esp_err_t can_master_home(uint8_t node_id, can_master_response_t *out, uint32_t timeout_ms)
 {
     return send_and_wait(node_id, CAN_CMD_HOME, NULL, 0, out, timeout_ms);
@@ -963,12 +966,9 @@ esp_err_t can_master_upload_gcode_program(uint8_t node_id, uint8_t slot, const u
     }
 
     ESP_LOGI(TAG, "UPLOAD done node=%u slot=%u bytes=%u", (unsigned)node_id, (unsigned)slot, (unsigned)size_bytes);
+    vTaskDelay(pdMS_TO_TICKS(120));
+    can_master_clear_pending_responses();
     return ESP_OK;
-}
-
-esp_err_t can_master_upload_nc_program(uint8_t node_id, uint8_t slot, const uint8_t *program_bytes, size_t size_bytes, uint32_t timeout_ms)
-{
-    return can_master_upload_gcode_program(node_id, slot, program_bytes, size_bytes, timeout_ms);
 }
 
 esp_err_t can_master_get_last_status(uint8_t node_id, can_master_status_t *out)
@@ -1060,161 +1060,4 @@ size_t can_master_count_online_nodes(const uint8_t *node_ids, size_t node_count,
         }
     }
     return online_count;
-}
-
-esp_err_t can_master_debug_probe(can_master_probe_t *out_probe)
-{
-    if (out_probe == NULL) return ESP_ERR_INVALID_ARG;
-    if (s_spi == NULL) return ESP_ERR_INVALID_STATE;
-    if (!lock_spi()) {
-        ESP_LOGE(TAG, "probe: SPI lock timeout");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    memset(out_probe, 0, sizeof(*out_probe));
-
-    esp_err_t err = ESP_OK;
-    err = mcp_read_reg_locked(REG_CANSTAT, &out_probe->canstat);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read CANSTAT failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_CANCTRL, &out_probe->canctrl);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read CANCTRL failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_CNF1, &out_probe->cnf1);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read CNF1 failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_CNF2, &out_probe->cnf2);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read CNF2 failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_CNF3, &out_probe->cnf3);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read CNF3 failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_CANINTE, &out_probe->caninte);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read CANINTE failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_CANINTF, &out_probe->canintf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read CANINTF failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_EFLG, &out_probe->eflg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read EFLG failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_TXB0CTRL, &out_probe->txb0ctrl);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read TXB0CTRL failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_RXB0CTRL, &out_probe->rxb0ctrl);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read RXB0CTRL failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-    err = mcp_read_reg_locked(REG_RXB1CTRL, &out_probe->rxb1ctrl);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "probe: read RXB1CTRL failed (%s)", esp_err_to_name(err));
-        goto done;
-    }
-
-done:
-    unlock_spi();
-    return err;
-}
-
-esp_err_t can_master_debug_loopback(can_master_loopback_result_t *out_result)
-{
-    if (out_result == NULL) return ESP_ERR_INVALID_ARG;
-    if (!s_ready) return ESP_ERR_INVALID_STATE;
-    if (!lock_spi()) return ESP_ERR_TIMEOUT;
-
-    memset(out_result, 0, sizeof(*out_result));
-    out_result->tx_id = 0x123U;
-    out_result->dlc = 8;
-    out_result->tx_data[0] = 0xA5;
-    out_result->tx_data[1] = 0x5A;
-    out_result->tx_data[2] = 0x11;
-    out_result->tx_data[3] = 0x22;
-    out_result->tx_data[4] = 0x33;
-    out_result->tx_data[5] = 0x44;
-    out_result->tx_data[6] = 0x55;
-    out_result->tx_data[7] = 0x66;
-
-    esp_err_t err = mcp_set_mode_locked(CANCTRL_REQOP_LOOPBACK);
-    if (err != ESP_OK) {
-        unlock_spi();
-        return err;
-    }
-
-    (void)mcp_write_reg_locked(REG_CANINTF, 0x00);
-    (void)mcp_write_reg_locked(REG_EFLG, 0x00);
-
-    err = mcp_send_std_locked(out_result->tx_id, out_result->tx_data, out_result->dlc);
-    if (err == ESP_OK) {
-        for (int i = 0; i < 50; i++) {
-            uint8_t intf = 0;
-            err = mcp_read_reg_locked(REG_CANINTF, &intf);
-            if (err != ESP_OK) {
-                break;
-            }
-
-            if (intf & CANINTF_RX0IF) {
-                mcp_frame_t frame = {0};
-                err = mcp_read_frame_locked(false, &frame);
-                (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_RX0IF, 0x00);
-                if (err == ESP_OK) {
-                    out_result->rx_id = frame.id;
-                    out_result->dlc = frame.dlc;
-                    memcpy(out_result->rx_data, frame.data, frame.dlc);
-                    out_result->matched = (frame.id == out_result->tx_id) &&
-                                          (frame.dlc == 8U) &&
-                                          (memcmp(frame.data, out_result->tx_data, 8U) == 0);
-                    err = out_result->matched ? ESP_OK : ESP_FAIL;
-                }
-                break;
-            }
-
-            if (intf & CANINTF_RX1IF) {
-                mcp_frame_t frame = {0};
-                err = mcp_read_frame_locked(true, &frame);
-                (void)mcp_bit_modify_locked(REG_CANINTF, CANINTF_RX1IF, 0x00);
-                if (err == ESP_OK) {
-                    out_result->rx_id = frame.id;
-                    out_result->dlc = frame.dlc;
-                    memcpy(out_result->rx_data, frame.data, frame.dlc);
-                    out_result->matched = (frame.id == out_result->tx_id) &&
-                                          (frame.dlc == 8U) &&
-                                          (memcmp(frame.data, out_result->tx_data, 8U) == 0);
-                    err = out_result->matched ? ESP_OK : ESP_FAIL;
-                }
-                break;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(1));
-            err = ESP_ERR_TIMEOUT;
-        }
-    }
-
-    (void)mcp_write_reg_locked(REG_CANINTF, 0x00);
-    (void)mcp_write_reg_locked(REG_EFLG, 0x00);
-    esp_err_t restore_err = mcp_set_mode_locked(CANCTRL_REQOP_NORMAL);
-    unlock_spi();
-
-    if (err == ESP_OK && restore_err != ESP_OK) {
-        return restore_err;
-    }
-    return err;
 }

@@ -44,12 +44,30 @@ static const uint8_t CONFIGURED_NODE_IDS[] = {CAN_MASTER_NODE1_ID, CAN_MASTER_NO
 #define RELAY_NODE2_RETURN_SLOT 1U
 #define RELAY_NODE1_RETURN_SLOT 1U
 
+#define SYNC_MEASURE_DEFAULT_DURATION_MS 2U
+#define SYNC_MEASURE_MIN_DURATION_MS 1U
+#define SYNC_MEASURE_MAX_DURATION_MS 60000U
+#define SYNC_MEASURE_SLOT 3U
+#define SYNC_MEASURE_STOP_MARGIN_MS 3000U
+#define SYNC_MEASURE_GCODE_BUFFER_SIZE 192U
+#define RUN_SYNC_DEFAULT_SLOT 0U
+
 static const char DEFAULT_GCODE[] =
+    "G21\n"
     "G90\n"
-    "G0 X130 Y0 Z80\n"
-    "G1 X145 Y0 Z70 F1200\n"
-    "G1 X145 Y35 Z70 F1200\n"
-    "G1 X130 Y35 Z80 F1200\n"
+    "F700\n"
+    "\n"
+    "G0 X0 Y0 Z25 P-20\n"
+    "G4 P200\n"
+    "G1 X30 Y0 Z25 P-20\n"
+    "G4 P200\n"
+    "G1 X30 Y30 Z25 P-20\n"
+    "G4 P200\n"
+    "G1 X0 Y30 Z25 P-20\n"
+    "G4 P200\n"
+    "G1 X0 Y0 Z25 P-20\n"
+    "G4 P200\n"
+    "G1 X0 Y0 Z0 P-53\n"
     "M30\n";
 
 typedef struct {
@@ -58,11 +76,11 @@ typedef struct {
     const char *label;
 } relay_step_t;
 
-static TaskHandle_t s_relay_task = NULL;
 static volatile bool s_relay_running = false;
 static volatile bool s_relay_stop_requested = false;
 static volatile uint32_t s_relay_target_cycles = 0;
 static volatile uint32_t s_relay_active_cycle = 0;
+static bool s_sync_measure_close_next = true;
 static portMUX_TYPE s_relay_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void print_response_line(const can_master_response_t *resp);
@@ -216,31 +234,6 @@ static void print_status_snapshot(const can_master_status_t *status)
            (unsigned)status->active_slot,
            can_master_protocol_result_to_str(status->last_protocol_error),
            (unsigned)status->last_robot_error);
-}
-
-static esp_err_t request_and_read_status(uint8_t node_id, can_master_status_t *out_status)
-{
-    if (out_status == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    can_master_clear_pending_responses();
-
-    can_master_response_t resp = {0};
-    esp_err_t err = can_master_request_status(node_id, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    for (int attempt = 0; attempt < 10; attempt++) {
-        err = can_master_get_last_status(node_id, out_status);
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-
-    return err;
 }
 
 static bool relay_is_running(void)
@@ -880,6 +873,111 @@ static int cmd_can_upload_file(const char *target, const char *slot_arg, const c
     return 0;
 }
 
+static int cmd_can_run_sync(int argc, char **argv)
+{
+    uint8_t node = 0;
+    bool all = false;
+    if (!parse_node_or_all(argv[2], &node, &all)) {
+        printf("ERR: invalid node target\n");
+        return 0;
+    }
+
+    if (!all) {
+        printf("ERR: run_sync supports only `all`; use `can run <node> <slot>` for one node\n");
+        return 0;
+    }
+
+    uint8_t slot = RUN_SYNC_DEFAULT_SLOT;
+    if (argc == 5 && !parse_slot_arg(argv[4], &slot)) {
+        printf("ERR: invalid slot\n");
+        return 0;
+    }
+
+    char path[160] = {0};
+    if (!normalize_spiffs_path(argv[3], path, sizeof(path))) {
+        printf("ERR: invalid path\n");
+        return 0;
+    }
+
+    uint8_t *file_data = NULL;
+    size_t file_size = 0;
+    esp_err_t err = load_file_from_spiffs(path, &file_data, &file_size);
+    if (err != ESP_OK) {
+        printf("ERR: read %s failed (%s)\n", path, esp_err_to_name(err));
+        printf("Hint: put your file into SPIFFS image under spiffs/data.\n");
+        return 0;
+    }
+
+    printf("RUN_SYNC: loaded %s (%u bytes), slot=%u\n",
+           path,
+           (unsigned)file_size,
+           (unsigned)slot);
+
+    can_master_clear_pending_responses();
+    (void)can_master_stop_all();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    can_master_clear_pending_responses();
+
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        const uint8_t current_node = CONFIGURED_NODE_IDS[i];
+        can_master_response_t resp = {0};
+
+        printf("RUN_SYNC: arm node=%u\n", (unsigned)current_node);
+        err = can_master_arm(current_node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (resp.node_id != 0U) {
+            print_response_line(&resp);
+        }
+        if (err != ESP_OK) {
+            printf("ERR: node=%u arm failed (%s)\n", (unsigned)current_node, esp_err_to_name(err));
+            free(file_data);
+            return 0;
+        }
+    }
+
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        const uint8_t current_node = CONFIGURED_NODE_IDS[i];
+
+        can_master_clear_pending_responses();
+        printf("RUN_SYNC: upload node=%u slot=%u\n", (unsigned)current_node, (unsigned)slot);
+        err = can_master_upload_gcode_program(current_node,
+                                              slot,
+                                              file_data,
+                                              file_size,
+                                              CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            printf("ERR: node=%u upload failed (%s)\n", (unsigned)current_node, esp_err_to_name(err));
+            free(file_data);
+            return 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_master_clear_pending_responses();
+    }
+
+    free(file_data);
+
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        const uint8_t current_node = CONFIGURED_NODE_IDS[i];
+        can_master_response_t resp = {0};
+
+        can_master_clear_pending_responses();
+        printf("RUN_SYNC: prepare node=%u slot=%u\n", (unsigned)current_node, (unsigned)slot);
+        err = can_master_prepare_slot(current_node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (resp.node_id != 0U) {
+            print_response_line(&resp);
+        }
+        if (err != ESP_OK) {
+            printf("ERR: node=%u prepare failed (%s)\n", (unsigned)current_node, esp_err_to_name(err));
+            return 0;
+        }
+    }
+
+    can_master_clear_pending_responses();
+    printf("RUN_SYNC: sync start\n");
+    err = can_master_sync_start_all();
+    printf(err == ESP_OK ? "OK: run_sync started\n" : "ERR: sync start failed\n");
+    return 0;
+}
+
 static int cmd_can_seq(int argc, char **argv)
 {
     uint8_t slot = 0;
@@ -904,6 +1002,156 @@ static int cmd_can_seq(int argc, char **argv)
     printf("SEQ: sync\n");
     esp_err_t err = can_master_sync_start_all();
     printf(err == ESP_OK ? "OK: sync start sent\n" : "ERR: sync start failed\n");
+    return 0;
+}
+
+static bool parse_sync_measure_duration_arg(const char *arg, uint32_t *out_duration_ms)
+{
+    if (arg == NULL || out_duration_ms == NULL) {
+        return false;
+    }
+
+    char *end = NULL;
+    unsigned long parsed_ms = strtoul(arg, &end, 0);
+    if (end == arg || *end != '\0' ||
+        parsed_ms < SYNC_MEASURE_MIN_DURATION_MS ||
+        parsed_ms > SYNC_MEASURE_MAX_DURATION_MS) {
+        return false;
+    }
+
+    *out_duration_ms = (uint32_t)parsed_ms;
+    return true;
+}
+
+static esp_err_t sync_measure_upload_program_all(uint8_t slot, const char *label, const char *program)
+{
+    if (label == NULL || program == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        const uint8_t node_id = CONFIGURED_NODE_IDS[i];
+        printf("MEASURE_SYNC: upload %s node=%u slot=%u\n",
+               label,
+               (unsigned)node_id,
+               (unsigned)slot);
+
+        can_master_clear_pending_responses();
+        esp_err_t err = can_master_upload_gcode_program(node_id,
+                                                        slot,
+                                                        (const uint8_t *)program,
+                                                        strlen(program),
+                                                        CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            printf("ERR: node=%u upload %s failed (%s)\n",
+                   (unsigned)node_id,
+                   label,
+                   esp_err_to_name(err));
+            return err;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_master_clear_pending_responses();
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t sync_measure_prepare_all(uint8_t slot)
+{
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        const uint8_t node_id = CONFIGURED_NODE_IDS[i];
+        can_master_response_t resp = {0};
+
+        can_master_clear_pending_responses();
+        printf("MEASURE_SYNC: prepare node=%u slot=%u\n", (unsigned)node_id, (unsigned)slot);
+        esp_err_t err = can_master_prepare_slot(node_id, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (resp.node_id != 0U) {
+            print_response_line(&resp);
+        }
+        if (err != ESP_OK) {
+            printf("ERR: node=%u prepare failed (%s)\n", (unsigned)node_id, esp_err_to_name(err));
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static int cmd_can_measure_sync(int argc, char **argv)
+{
+    uint32_t duration_ms = SYNC_MEASURE_DEFAULT_DURATION_MS;
+    if (argc == 3 && !parse_sync_measure_duration_arg(argv[2], &duration_ms)) {
+        printf("ERR: invalid duration_ms, use %u..%u\n",
+               (unsigned)SYNC_MEASURE_MIN_DURATION_MS,
+               (unsigned)SYNC_MEASURE_MAX_DURATION_MS);
+        return 0;
+    }
+
+    const unsigned gripper_angle_deg = s_sync_measure_close_next ? 0U : 90U;
+    char measure_gcode[SYNC_MEASURE_GCODE_BUFFER_SIZE] = {0};
+    const uint32_t dwell_ms = duration_ms + SYNC_MEASURE_STOP_MARGIN_MS;
+    int written = snprintf(measure_gcode,
+                           sizeof(measure_gcode),
+                           "G21\n"
+                           "G90\n"
+                           "M280 S%u\n"
+                           "G4 P%u\n"
+                           "M30\n",
+                           gripper_angle_deg,
+                           (unsigned)dwell_ms);
+    if (written <= 0 || (size_t)written >= sizeof(measure_gcode)) {
+        printf("ERR: measure G-code build failed\n");
+        return 0;
+    }
+
+    printf("MEASURE_SYNC: one-shot setup uses slot=%u and overwrites it\n", (unsigned)SYNC_MEASURE_SLOT);
+    printf("MEASURE_SYNC: target gripper angle S%u (next run toggles)\n", gripper_angle_deg);
+
+    esp_err_t err = ESP_OK;
+
+    can_master_clear_pending_responses();
+    (void)can_master_stop_all();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    can_master_clear_pending_responses();
+
+    printf("MEASURE_SYNC: broadcast ARM\n");
+    err = can_master_arm_all();
+    if (err != ESP_OK) {
+        printf("ERR: arm all failed (%s)\n", esp_err_to_name(err));
+        return 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+    can_master_clear_pending_responses();
+
+    err = sync_measure_upload_program_all(SYNC_MEASURE_SLOT, "measure", measure_gcode);
+    if (err != ESP_OK) {
+        return 0;
+    }
+
+    err = sync_measure_prepare_all(SYNC_MEASURE_SLOT);
+    if (err != ESP_OK) {
+        return 0;
+    }
+
+    can_master_clear_pending_responses();
+    printf("MEASURE_SYNC: t=0 ms send SYNC_START\n");
+    err = can_master_sync_start_all();
+    if (err != ESP_OK) {
+        printf("ERR: sync start failed (%s)\n", esp_err_to_name(err));
+        return 0;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(duration_ms));
+
+    printf("MEASURE_SYNC: t=%u ms send DISARM\n", (unsigned)duration_ms);
+    err = can_master_disarm_all();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    can_master_clear_pending_responses();
+    if (err == ESP_OK) {
+        s_sync_measure_close_next = !s_sync_measure_close_next;
+    }
+    printf(err == ESP_OK ? "OK: measure_sync finished\n" : "ERR: disarm failed\n");
     return 0;
 }
 
@@ -968,7 +1216,6 @@ static void relay_task(void *arg)
     s_relay_stop_requested = false;
     s_relay_target_cycles = 0;
     s_relay_active_cycle = 0;
-    s_relay_task = NULL;
     taskEXIT_CRITICAL(&s_relay_mux);
 
     vTaskDelete(NULL);
@@ -1028,31 +1275,24 @@ static int cmd_can_relay(int argc, char **argv)
     s_relay_stop_requested = false;
     s_relay_target_cycles = cycles;
     s_relay_active_cycle = 0;
-    s_relay_task = NULL;
     taskEXIT_CRITICAL(&s_relay_mux);
 
-    TaskHandle_t relay_task_handle = NULL;
     BaseType_t created = xTaskCreate(relay_task,
                                      "relay_task",
                                      RELAY_TASK_STACK_SIZE,
                                      (void *)(uintptr_t)cycles,
                                      RELAY_TASK_PRIORITY,
-                                     &relay_task_handle);
+                                     NULL);
     if (created != pdPASS) {
         taskENTER_CRITICAL(&s_relay_mux);
         s_relay_running = false;
         s_relay_stop_requested = false;
         s_relay_target_cycles = 0;
         s_relay_active_cycle = 0;
-        s_relay_task = NULL;
         taskEXIT_CRITICAL(&s_relay_mux);
         printf("ERR: relay task start failed\n");
         return 0;
     }
-
-    taskENTER_CRITICAL(&s_relay_mux);
-    s_relay_task = relay_task_handle;
-    taskEXIT_CRITICAL(&s_relay_mux);
 
     printf("OK: relay started (%" PRIu32 " cycle(s)); use `can relay status` or `can stop`\n", cycles);
     return 0;
@@ -1071,9 +1311,11 @@ static int cmd_can(int argc, char **argv)
         printf("  can sensors <node|all>\n");
         printf("  can prepare <node|all> <slot>\n");
         printf("  can run <node|all> <slot>\n");
+        printf("  can run_sync all <path> [slot]   (loads /spiffs/<path>, default slot 0)\n");
         printf("  can delete <node|all> <slot>\n");
         printf("  can stop\n");
         printf("  can sync\n");
+        printf("  can measure_sync [duration_ms]\n");
         printf("  can upload <node|all> <slot>   (uploads DEFAULT_GCODE)\n");
         printf("  can upload_file <node|all> <slot> <path>   (loads /spiffs/<path>)\n");
         printf("  can seq [slot]\n");
@@ -1131,6 +1373,22 @@ static int cmd_can(int argc, char **argv)
         esp_err_t err = can_master_sync_start_all();
         printf(err == ESP_OK ? "OK: sync start sent\n" : "ERR: sync start failed\n");
         return 0;
+    }
+
+    if (strcmp(argv[1], "measure_sync") == 0) {
+        if (argc != 2 && argc != 3) {
+            printf("Usage: can measure_sync [duration_ms]\n");
+            return 0;
+        }
+        return cmd_can_measure_sync(argc, argv);
+    }
+
+    if (strcmp(argv[1], "run_sync") == 0) {
+        if (argc != 4 && argc != 5) {
+            printf("Usage: can run_sync all <path> [slot]\n");
+            return 0;
+        }
+        return cmd_can_run_sync(argc, argv);
     }
 
     if (strcmp(argv[1], "seq") == 0) {

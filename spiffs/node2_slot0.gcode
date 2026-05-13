@@ -1,60 +1,46 @@
 ; ==========================================
-; node2 slot0
-; LEFT robot: HOME -> pick A -> place B -> HOME
+; node2_slot0.gcode
+; node2: pick A -> place B
 ; ==========================================
-; Starter coordinates for node2.
-; The structure matches the proven pick_cube motion profile, but these
-; coordinates are intended as a first draft for the left robot and should
-; be tuned on the real setup.
+; A = X190 Y0   Z-20 P-50
+; via with cube = X150 Y0, lifted above the surface (P-80 keeps this point reachable)
+; B = X105 Y190 Z-10 P-50
 ;
-; A (pickup on node2) - tune as needed:
-;   hover    X-20 Y-250 Z25
-;   approach X-20 Y-250 Z-50
-;   pick     X-20 Y-250 Z-85
-; B (place on node2) - tune as needed:
-;   hover    X90 Y0 Z25
-;   approach X90 Y0 Z-110
-;   place    X90 Y0 Z-140
-; HOME:
-;   X0 Y0 Z0
+; Fast empty moves: F6000
+; Carry moves with cube: F4800
+; Final 5 mm approach: F1200
 
 G21
 G90
-F700
 
+; Open before pickup.
 M10
-G4 P250
+G4 P120
 
-; HOME -> A
-G0 X0 Y0 Z25 P-20
-G4 P150
-G0 X-20 Y-250 Z25 P-20
-G4 P200
-G1 X-20 Y-250 Z-50 P-30 F700
-G4 P150
-G1 X-20 Y-250 Z-85 P-53 F450
-G4 P250
+; ---------- A: pick cube ----------
+G1 X190 Y0 Z-15 P-50 F6000
+G1 X190 Y0 Z-20 P-50 F1200
+G4 P80
+
 M11
-G4 P350
-G1 X-20 Y-250 Z-50 P-30 F500
-G1 X-20 Y-250 Z25 P-20 F700
-G4 P200
+G4 P260
 
-; A -> B
-G0 X90 Y0 Z25 P-53
-G4 P200
-G1 X90 Y0 Z-110 P-53 F700
-G4 P150
-G1 X90 Y0 Z-140 P-53 F450
-G4 P250
+; Lift above the surface, then carry through the via point.
+G1 X190 Y0 Z40 P-50 F1200
+G1 X150 Y0 Z40 P-80 F4800
+
+; ---------- B: place cube ----------
+G1 X95 Y190 Z-5  P-50 F4800
+G1 X95 Y190 Z-10 P-50 F1200
+G4 P80
+
 M10
-G4 P300
-G1 X90 Y0 Z-110 P-53 F500
-G1 X90 Y0 Z25 P-53 F700
-G4 P200
+G4 P220
 
-; B -> HOME
-G0 X0 Y0 Z25 P-53
-G4 P150
-G0 X0 Y0 Z0 P-53
+; Small retreat after release.
+G1 X105 Y190 Z-5 P-50 F3000
+
+; Return HOME
+G0 X115 Y0 Z123 P-60
+
 M30
