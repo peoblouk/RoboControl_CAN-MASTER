@@ -1,6 +1,8 @@
 #include "cmd_control.h"
 
 #include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,44 +15,38 @@
 #include "linenoise/linenoise.h"
 #include "sdkconfig.h"
 
-static const char *TAG = "cmd";
-static esp_console_repl_t *s_repl = NULL;
 static const uint8_t CONFIGURED_NODE_IDS[] = {CAN_MASTER_NODE1_ID, CAN_MASTER_NODE2_ID};
-#define CONFIGURED_NODE_COUNT (sizeof(CONFIGURED_NODE_IDS) / sizeof(CONFIGURED_NODE_IDS[0]))
-#define CAN_STATE_FLAG_ARMED (1U << 0)
-#define CAN_STATE_FLAG_REFERENCED (1U << 2)
-#define CAN_STATE_FLAG_TCP_EST (1U << 3)
-#define CAN_STATE_FLAG_PROGRAM_RUNNING (1U << 6)
-#define CAN_STATE_FLAG_ERROR (1U << 7)
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define CONFIGURED_NODE_COUNT ARRAY_SIZE(CONFIGURED_NODE_IDS)
 
-#define ROBOT_STATE_DISARMED 0U
-#define ROBOT_STATE_UNREFERENCED 1U
-#define ROBOT_STATE_READY 2U
-#define ROBOT_STATE_RUNNING 3U
-#define ROBOT_STATE_READY_FOR_SYNC 4U
-#define ROBOT_STATE_ERROR 5U
+typedef esp_err_t (*node_response_fn_t)(uint8_t node_id, can_master_response_t *out, uint32_t timeout_ms);
 
-#define CAN_SLOT_NONE 0xFFU
+typedef enum {
+    SLOT_OP_PREPARE,
+    SLOT_OP_RUN,
+    SLOT_OP_UPLOAD,
+    SLOT_OP_DELETE,
+} slot_op_t;
 
-#define RELAY_STATUS_POLL_MS 100U
-#define RELAY_READY_GRACE_MS 1200U
-#define RELAY_READY_TIMEOUT_MS 120000U
-#define RELAY_HOME_SETTLE_TIMEOUT_MS 120000U
-#define RELAY_TASK_STACK_SIZE 6144U
-#define RELAY_TASK_PRIORITY 5U
+typedef struct {
+    uint8_t ids[CONFIGURED_NODE_COUNT];
+    size_t count;
+    bool all;
+} node_target_t;
 
-#define RELAY_NODE1_FORWARD_SLOT 0U
-#define RELAY_NODE2_FORWARD_SLOT 0U
-#define RELAY_NODE2_RETURN_SLOT 1U
-#define RELAY_NODE1_RETURN_SLOT 1U
+typedef struct {
+    uint8_t node_id;
+    uint8_t slot;
+    const char *label;
+} relay_step_t;
 
-#define SYNC_MEASURE_DEFAULT_DURATION_MS 2U
-#define SYNC_MEASURE_MIN_DURATION_MS 1U
-#define SYNC_MEASURE_MAX_DURATION_MS 60000U
-#define SYNC_MEASURE_SLOT 3U
-#define SYNC_MEASURE_STOP_MARGIN_MS 3000U
-#define SYNC_MEASURE_GCODE_BUFFER_SIZE 192U
-#define RUN_SYNC_DEFAULT_SLOT 0U
+static const char *TAG = "cmd";
+static volatile bool s_relay_running;
+static volatile bool s_relay_stop_requested;
+static volatile uint32_t s_relay_target_cycles;
+static volatile uint32_t s_relay_active_cycle;
+
+static portMUX_TYPE s_relay_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static const char DEFAULT_GCODE[] =
     "G21\n"
@@ -70,140 +66,109 @@ static const char DEFAULT_GCODE[] =
     "G1 X0 Y0 Z0 P-53\n"
     "M30\n";
 
-typedef struct {
-    uint8_t node_id;
-    uint8_t slot;
-    const char *label;
-} relay_step_t;
+static const char CAN_USAGE[] =
+    "Usage:\n"
+    "  can init\n"
+    "  can nodes\n"
+    "  can arm <node|all>\n"
+    "  can disarm <node|all>\n"
+    "  can home <node|all>\n"
+    "  can status <node|all>\n"
+    "  can sensors <node|all>\n"
+    "  can prepare <node|all> <slot>\n"
+    "  can run <node|all> <slot>\n"
+    "  can run_sync all <path> [slot]   (loads /spiffs/<path>, default slot 0)\n"
+    "  can delete <node|all> <slot>\n"
+    "  can stop\n"
+    "  can sync\n"
+    "  can measure_sync [duration_ms]\n"
+    "  can upload <node|all> <slot>   (uploads DEFAULT_GCODE)\n"
+    "  can upload_file <node|all> <slot> <path>   (loads /spiffs/<path>)\n"
+    "  can seq [slot]\n"
+    "  can relay [cycles]\n"
+    "  can relay status\n"
+    "  can relay stop\n";
 
-static volatile bool s_relay_running = false;
-static volatile bool s_relay_stop_requested = false;
-static volatile uint32_t s_relay_target_cycles = 0;
-static volatile uint32_t s_relay_active_cycle = 0;
-static bool s_sync_measure_close_next = true;
-static portMUX_TYPE s_relay_mux = portMUX_INITIALIZER_UNLOCKED;
-
-static void print_response_line(const can_master_response_t *resp);
-static bool relay_is_running(void);
-static bool relay_stop_requested(void);
-static void relay_request_stop(void);
-static void relay_set_cycle_progress(uint32_t active_cycle);
-static void relay_get_progress(uint32_t *out_active_cycle, uint32_t *out_target_cycles);
-static esp_err_t relay_execute_cycles(uint32_t cycles);
-static void relay_task(void *arg);
-
-static bool parse_slot_arg(const char *arg, uint8_t *out_slot)
+static bool parse_u32_arg(const char *arg, uint32_t min, uint32_t max, uint32_t *out)
 {
-    if (arg == NULL || out_slot == NULL) {
-        return false;
-    }
-
+    if (arg == NULL || out == NULL) return false;
     char *end = NULL;
-    unsigned long parsed_slot = strtoul(arg, &end, 0);
-    if (end == arg || *end != '\0' || parsed_slot >= CAN_PROGRAM_SLOT_COUNT) {
-        return false;
-    }
-
-    *out_slot = (uint8_t)parsed_slot;
+    unsigned long value = strtoul(arg, &end, 0);
+    if (end == arg || *end != '\0' || value < min || value > max) return false;
+    *out = (uint32_t)value;
     return true;
 }
 
-static bool parse_cycle_count_arg(const char *arg, uint32_t *out_cycles)
+static bool parse_slot_arg(const char *arg, uint8_t *out_slot)
 {
-    if (arg == NULL || out_cycles == NULL) {
-        return false;
+    uint32_t slot = 0;
+    if (!parse_u32_arg(arg, 0, CAN_PROGRAM_SLOT_COUNT - 1U, &slot)) return false;
+    *out_slot = (uint8_t)slot;
+    return true;
+}
+
+static bool parse_node_target(const char *arg, node_target_t *target)
+{
+    if (arg == NULL || target == NULL) return false;
+    memset(target, 0, sizeof(*target));
+
+    if (strcmp(arg, "all") == 0) {
+        memcpy(target->ids, CONFIGURED_NODE_IDS, sizeof(CONFIGURED_NODE_IDS));
+        target->count = CONFIGURED_NODE_COUNT;
+        target->all = true;
+        return true;
     }
 
-    char *end = NULL;
-    unsigned long parsed_cycles = strtoul(arg, &end, 0);
-    if (end == arg || *end != '\0' || parsed_cycles == 0UL || parsed_cycles > 100000UL) {
-        return false;
-    }
-
-    *out_cycles = (uint32_t)parsed_cycles;
+    uint32_t node_id = 0;
+    if (!parse_u32_arg(arg, 1U, CAN_NODE_ID_MAX, &node_id)) return false;
+    target->ids[0] = (uint8_t)node_id;
+    target->count = 1U;
     return true;
 }
 
 static bool normalize_spiffs_path(const char *input, char *output, size_t output_size)
 {
-    if (input == NULL || output == NULL || output_size == 0U) {
-        return false;
-    }
-
-    int written = 0;
-    if (strncmp(input, "/spiffs/", 8) == 0) {
-        written = snprintf(output, output_size, "%s", input);
-    } else if (input[0] == '/') {
-        written = snprintf(output, output_size, "/spiffs%s", input);
-    } else {
-        written = snprintf(output, output_size, "/spiffs/%s", input);
-    }
+    if (input == NULL || output == NULL || output_size == 0U) return false;
+    const char *fmt = (strncmp(input, "/spiffs/", 8) == 0) ? "%s" : (input[0] == '/') ? "/spiffs%s" : "/spiffs/%s";
+    int written = snprintf(output, output_size, fmt, input);
     return written > 0 && (size_t)written < output_size;
 }
 
 static esp_err_t load_file_from_spiffs(const char *path, uint8_t **out_data, size_t *out_size)
 {
-    if (path == NULL || out_data == NULL || out_size == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (path == NULL || out_data == NULL || out_size == NULL) return ESP_ERR_INVALID_ARG;
 
     FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        return ESP_ERR_NOT_FOUND;
-    }
+    if (f == NULL) return ESP_ERR_NOT_FOUND;
 
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return ESP_FAIL;
-    }
+    esp_err_t err = ESP_FAIL;
+    uint8_t *data = NULL;
+    long file_size = 0;
 
-    long file_size = ftell(f);
+    if (fseek(f, 0, SEEK_END) != 0) goto done;
+    file_size = ftell(f);
     if (file_size <= 0 || file_size > 0xFFFFL) {
-        fclose(f);
-        return (file_size <= 0) ? ESP_ERR_INVALID_SIZE : ESP_ERR_INVALID_ARG;
+        err = (file_size <= 0) ? ESP_ERR_INVALID_SIZE : ESP_ERR_INVALID_ARG;
+        goto done;
     }
-
     rewind(f);
 
-    uint8_t *data = (uint8_t *)malloc((size_t)file_size);
+    data = (uint8_t *)malloc((size_t)file_size);
     if (data == NULL) {
-        fclose(f);
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto done;
     }
-
-    size_t read_count = fread(data, 1, (size_t)file_size, f);
-    fclose(f);
-    if (read_count != (size_t)file_size) {
-        free(data);
-        return ESP_FAIL;
-    }
+    if (fread(data, 1, (size_t)file_size, f) != (size_t)file_size) goto done;
 
     *out_data = data;
     *out_size = (size_t)file_size;
-    return ESP_OK;
-}
+    data = NULL;
+    err = ESP_OK;
 
-static bool parse_node_or_all(const char *arg, uint8_t *out_node, bool *out_all)
-{
-    if (arg == NULL || out_node == NULL || out_all == NULL) {
-        return false;
-    }
-
-    if (strcmp(arg, "all") == 0) {
-        *out_all = true;
-        *out_node = 0;
-        return true;
-    }
-
-    char *end = NULL;
-    unsigned long parsed = strtoul(arg, &end, 0);
-    if (end == arg || *end != '\0' || parsed == 0UL || parsed > CAN_NODE_ID_MAX) {
-        return false;
-    }
-
-    *out_all = false;
-    *out_node = (uint8_t)parsed;
-    return true;
+done:
+    free(data);
+    fclose(f);
+    return err;
 }
 
 static const char *robot_state_to_str(uint8_t state)
@@ -219,12 +184,24 @@ static const char *robot_state_to_str(uint8_t state)
     }
 }
 
+static void print_response_line(const can_master_response_t *resp)
+{
+    if (resp == NULL) return;
+    printf("node=%u cmd=0x%02X result=%s state=%u flags=0x%02X detail=[%u %u %u %u]\n",
+           (unsigned)resp->node_id,
+           (unsigned)resp->cmd,
+           can_master_protocol_result_to_str(resp->result),
+           (unsigned)resp->robot_state,
+           (unsigned)resp->state_flags,
+           (unsigned)resp->detail[0],
+           (unsigned)resp->detail[1],
+           (unsigned)resp->detail[2],
+           (unsigned)resp->detail[3]);
+}
+
 static void print_status_snapshot(const can_master_status_t *status)
 {
-    if (status == NULL) {
-        return;
-    }
-
+    if (status == NULL) return;
     printf("node=%u state=%s(%u) flags=0x%02X prepared_slot=%u active_slot=%u proto_err=%s robot_err=%u\n",
            (unsigned)status->node_id,
            robot_state_to_str(status->robot_state),
@@ -236,20 +213,64 @@ static void print_status_snapshot(const can_master_status_t *status)
            (unsigned)status->last_robot_error);
 }
 
+static void print_fixed_0p1_i16(int16_t value, int16_t invalid_value)
+{
+    if (value == invalid_value) {
+        printf("n/a");
+        return;
+    }
+
+    int32_t signed_value = value;
+    if (signed_value < 0) {
+        printf("-");
+        signed_value = -signed_value;
+    }
+    printf("%" PRId32 ".%" PRId32, signed_value / 10, signed_value % 10);
+}
+
+static void print_work_offset_values(const int16_t values_0p1mm[3])
+{
+    printf("[");
+    for (size_t i = 0; i < 3U; i++) {
+        if (i > 0) printf(" ");
+        print_fixed_0p1_i16(values_0p1mm[i], CAN_INFO_VALUE_INVALID_I16);
+    }
+    printf("]");
+}
+
+static void print_sensor_values_line(const can_master_sensor_values_t *sensors)
+{
+    if (sensors == NULL) return;
+    printf("node=%u sensors_deg=[", (unsigned)sensors->node_id);
+    for (size_t i = 0; i < 6U; i++) {
+        if (i > 0) printf(" ");
+        print_fixed_0p1_i16(sensors->values_0p1deg[i], CAN_INFO_VALUE_INVALID_I16);
+    }
+    printf("]\n");
+}
+
+static void relay_set_state(bool running, bool stop_requested, uint32_t target_cycles, uint32_t active_cycle)
+{
+    taskENTER_CRITICAL(&s_relay_mux);
+    s_relay_running = running;
+    s_relay_stop_requested = stop_requested;
+    s_relay_target_cycles = target_cycles;
+    s_relay_active_cycle = active_cycle;
+    taskEXIT_CRITICAL(&s_relay_mux);
+}
+
 static bool relay_is_running(void)
 {
-    bool running = false;
     taskENTER_CRITICAL(&s_relay_mux);
-    running = s_relay_running;
+    bool running = s_relay_running;
     taskEXIT_CRITICAL(&s_relay_mux);
     return running;
 }
 
 static bool relay_stop_requested(void)
 {
-    bool stop_requested = false;
     taskENTER_CRITICAL(&s_relay_mux);
-    stop_requested = s_relay_stop_requested;
+    bool stop_requested = s_relay_stop_requested;
     taskEXIT_CRITICAL(&s_relay_mux);
     return stop_requested;
 }
@@ -271,35 +292,32 @@ static void relay_set_cycle_progress(uint32_t active_cycle)
 static void relay_get_progress(uint32_t *out_active_cycle, uint32_t *out_target_cycles)
 {
     taskENTER_CRITICAL(&s_relay_mux);
-    if (out_active_cycle != NULL) {
-        *out_active_cycle = s_relay_active_cycle;
-    }
-    if (out_target_cycles != NULL) {
-        *out_target_cycles = s_relay_target_cycles;
-    }
+    if (out_active_cycle != NULL) *out_active_cycle = s_relay_active_cycle;
+    if (out_target_cycles != NULL) *out_target_cycles = s_relay_target_cycles;
     taskEXIT_CRITICAL(&s_relay_mux);
+}
+
+static esp_err_t stop_all_flushed(uint32_t settle_ms)
+{
+    can_master_clear_pending_responses();
+    esp_err_t err = can_master_stop_all();
+    vTaskDelay(pdMS_TO_TICKS(settle_ms));
+    can_master_clear_pending_responses();
+    return err;
 }
 
 static esp_err_t read_cached_status(uint8_t node_id, can_master_status_t *out_status)
 {
-    if (out_status == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (!can_master_node_is_online(node_id, CAN_MASTER_NODE_ONLINE_TIMEOUT_MS)) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    return can_master_get_last_status(node_id, out_status);
+    if (out_status == NULL) return ESP_ERR_INVALID_ARG;
+    return can_master_node_is_online(node_id, CAN_MASTER_NODE_ONLINE_TIMEOUT_MS)
+               ? can_master_get_last_status(node_id, out_status)
+               : ESP_ERR_NOT_FOUND;
 }
 
 static bool status_is_ready_for_program(const can_master_status_t *status)
 {
-    if (status == NULL) {
-        return false;
-    }
-
-    return status->robot_state == ROBOT_STATE_READY &&
+    return status != NULL &&
+           status->robot_state == ROBOT_STATE_READY &&
            status->active_slot == CAN_SLOT_NONE &&
            (status->state_flags & CAN_STATE_FLAG_ARMED) != 0U &&
            (status->state_flags & CAN_STATE_FLAG_REFERENCED) != 0U &&
@@ -310,13 +328,10 @@ static bool status_is_ready_for_program(const can_master_status_t *status)
 
 static bool status_is_running_expected_slot(const can_master_status_t *status, uint8_t slot)
 {
-    if (status == NULL) {
-        return false;
-    }
-
-    return status->robot_state == ROBOT_STATE_RUNNING ||
-           (status->state_flags & CAN_STATE_FLAG_PROGRAM_RUNNING) != 0U ||
-           status->active_slot == slot;
+    return status != NULL &&
+           (status->robot_state == ROBOT_STATE_RUNNING ||
+            (status->state_flags & CAN_STATE_FLAG_PROGRAM_RUNNING) != 0U ||
+            status->active_slot == slot);
 }
 
 static esp_err_t wait_for_node_ready(uint8_t node_id, uint8_t expected_slot, uint32_t timeout_ms)
@@ -328,13 +343,8 @@ static esp_err_t wait_for_node_ready(uint8_t node_id, uint8_t expected_slot, uin
 
     for (;;) {
         const TickType_t now = xTaskGetTickCount();
-        if ((now - start_tick) >= timeout_ticks) {
-            return (last_err != ESP_OK) ? last_err : ESP_ERR_TIMEOUT;
-        }
-
-        if (relay_stop_requested()) {
-            return ESP_ERR_INVALID_STATE;
-        }
+        if ((now - start_tick) >= timeout_ticks) return (last_err != ESP_OK) ? last_err : ESP_ERR_TIMEOUT;
+        if (relay_stop_requested()) return ESP_ERR_INVALID_STATE;
 
         can_master_status_t status = {0};
         last_err = read_cached_status(node_id, &status);
@@ -347,14 +357,9 @@ static esp_err_t wait_for_node_ready(uint8_t node_id, uint8_t expected_slot, uin
             print_status_snapshot(&status);
             return ESP_FAIL;
         }
-
-        if (expected_slot != CAN_SLOT_NONE && status_is_running_expected_slot(&status, expected_slot)) {
-            saw_running = true;
-        }
-
-        const uint32_t elapsed_ms = (uint32_t)pdTICKS_TO_MS(now - start_tick);
+        if (expected_slot != CAN_SLOT_NONE && status_is_running_expected_slot(&status, expected_slot)) saw_running = true;
         if (status_is_ready_for_program(&status) &&
-            (saw_running || elapsed_ms >= RELAY_READY_GRACE_MS)) {
+            (saw_running || (uint32_t)pdTICKS_TO_MS(now - start_tick) >= RELAY_READY_GRACE_MS)) {
             return ESP_OK;
         }
 
@@ -362,35 +367,25 @@ static esp_err_t wait_for_node_ready(uint8_t node_id, uint8_t expected_slot, uin
     }
 }
 
+static esp_err_t relay_send_response_cmd(uint8_t node_id, const char *name, node_response_fn_t fn)
+{
+    if (relay_stop_requested()) return ESP_ERR_INVALID_STATE;
+
+    can_master_response_t resp = {0};
+    can_master_clear_pending_responses();
+    esp_err_t err = fn(node_id, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+    if (resp.node_id != 0U) print_response_line(&resp);
+    if (err != ESP_OK) printf("ERR: node=%u %s failed (%s)\n", (unsigned)node_id, name, esp_err_to_name(err));
+    return err;
+}
+
 static esp_err_t relay_arm_and_home_node(uint8_t node_id)
 {
-    can_master_response_t resp = {0};
+    esp_err_t err = relay_send_response_cmd(node_id, "arm", can_master_arm);
+    if (err != ESP_OK) return err;
 
-    if (relay_stop_requested()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    can_master_clear_pending_responses();
-    esp_err_t err = can_master_arm(node_id, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        if (resp.node_id != 0U) print_response_line(&resp);
-        printf("ERR: node=%u arm failed (%s)\n", (unsigned)node_id, esp_err_to_name(err));
-        return err;
-    }
-    print_response_line(&resp);
-
-    if (relay_stop_requested()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    can_master_clear_pending_responses();
-    err = can_master_home(node_id, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        if (resp.node_id != 0U) print_response_line(&resp);
-        printf("ERR: node=%u home failed (%s)\n", (unsigned)node_id, esp_err_to_name(err));
-        return err;
-    }
-    print_response_line(&resp);
+    err = relay_send_response_cmd(node_id, "home", can_master_home);
+    if (err != ESP_OK) return err;
 
     err = wait_for_node_ready(node_id, CAN_SLOT_NONE, RELAY_HOME_SETTLE_TIMEOUT_MS);
     if (err != ESP_OK) {
@@ -404,9 +399,7 @@ static esp_err_t relay_arm_and_home_node(uint8_t node_id)
 
 static esp_err_t relay_broadcast_home_all(void)
 {
-    if (relay_stop_requested()) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (relay_stop_requested()) return ESP_ERR_INVALID_STATE;
 
     can_master_clear_pending_responses();
     printf("RELAY: broadcast HOME to both nodes\n");
@@ -416,20 +409,13 @@ static esp_err_t relay_broadcast_home_all(void)
         return err;
     }
 
-    err = wait_for_node_ready(CAN_MASTER_NODE1_ID, CAN_SLOT_NONE, RELAY_HOME_SETTLE_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        printf("ERR: node=%u broadcast HOME did not finish cleanly (%s)\n",
-               (unsigned)CAN_MASTER_NODE1_ID,
-               esp_err_to_name(err));
-        return err;
-    }
-
-    err = wait_for_node_ready(CAN_MASTER_NODE2_ID, CAN_SLOT_NONE, RELAY_HOME_SETTLE_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        printf("ERR: node=%u broadcast HOME did not finish cleanly (%s)\n",
-               (unsigned)CAN_MASTER_NODE2_ID,
-               esp_err_to_name(err));
-        return err;
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        uint8_t node = CONFIGURED_NODE_IDS[i];
+        err = wait_for_node_ready(node, CAN_SLOT_NONE, RELAY_HOME_SETTLE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            printf("ERR: node=%u broadcast HOME did not finish cleanly (%s)\n", (unsigned)node, esp_err_to_name(err));
+            return err;
+        }
     }
 
     printf("OK: synchronized HOME reference finished on both nodes\n");
@@ -438,31 +424,22 @@ static esp_err_t relay_broadcast_home_all(void)
 
 static esp_err_t relay_run_step(const relay_step_t *step)
 {
-    if (step == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (step == NULL) return ESP_ERR_INVALID_ARG;
+    if (relay_stop_requested()) return ESP_ERR_INVALID_STATE;
 
     can_master_response_t resp = {0};
-    printf("RELAY: run node=%u slot=%u (%s)\n",
-           (unsigned)step->node_id,
-           (unsigned)step->slot,
-           step->label);
-
-    if (relay_stop_requested()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
+    printf("RELAY: run node=%u slot=%u (%s)\n", (unsigned)step->node_id, (unsigned)step->slot, step->label);
     can_master_clear_pending_responses();
+
     esp_err_t err = can_master_program_run(step->node_id, step->slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+    if (resp.node_id != 0U) print_response_line(&resp);
     if (err != ESP_OK) {
-        if (resp.node_id != 0U) print_response_line(&resp);
         printf("ERR: node=%u slot=%u run failed (%s)\n",
                (unsigned)step->node_id,
                (unsigned)step->slot,
                esp_err_to_name(err));
         return err;
     }
-    print_response_line(&resp);
 
     err = wait_for_node_ready(step->node_id, step->slot, RELAY_READY_TIMEOUT_MS);
     if (err != ESP_OK) {
@@ -473,359 +450,174 @@ static esp_err_t relay_run_step(const relay_step_t *step)
         return err;
     }
 
-    printf("OK: node=%u slot=%u finished (%s)\n",
-           (unsigned)step->node_id,
-           (unsigned)step->slot,
-           step->label);
+    printf("OK: node=%u slot=%u finished (%s)\n", (unsigned)step->node_id, (unsigned)step->slot, step->label);
     return ESP_OK;
-}
-
-static void print_configured_nodes(void)
-{
-    printf("Configured nodes (online timeout %u ms):\n", (unsigned)CAN_MASTER_NODE_ONLINE_TIMEOUT_MS);
-    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-        const uint8_t node_id = CONFIGURED_NODE_IDS[i];
-        printf("  node=%u %s\n",
-               (unsigned)node_id,
-               can_master_node_is_online(node_id, CAN_MASTER_NODE_ONLINE_TIMEOUT_MS) ? "online" : "offline");
-    }
-}
-
-static void print_response_line(const can_master_response_t *resp)
-{
-    if (resp == NULL) {
-        return;
-    }
-
-    printf("node=%u cmd=0x%02X result=%s state=%u flags=0x%02X detail=[%u %u %u %u]\n",
-           (unsigned)resp->node_id,
-           (unsigned)resp->cmd,
-           can_master_protocol_result_to_str(resp->result),
-           (unsigned)resp->robot_state,
-           (unsigned)resp->state_flags,
-           (unsigned)resp->detail[0],
-           (unsigned)resp->detail[1],
-           (unsigned)resp->detail[2],
-           (unsigned)resp->detail[3]);
-}
-
-static void print_fixed_0p1_i16(int16_t value, int16_t invalid_value)
-{
-    if (value == invalid_value) {
-        printf("n/a");
-        return;
-    }
-
-    int32_t signed_value = (int32_t)value;
-    if (signed_value < 0) {
-        printf("-");
-        signed_value = -signed_value;
-    }
-    printf("%" PRId32 ".%" PRId32, signed_value / 10, signed_value % 10);
-}
-
-static void print_work_offset_values(const int16_t values_0p1mm[3])
-{
-    printf("[");
-    for (size_t i = 0; i < 3U; i++) {
-        if (i > 0) printf(" ");
-        print_fixed_0p1_i16(values_0p1mm[i], CAN_INFO_VALUE_INVALID_I16);
-    }
-    printf("]");
-}
-
-static void print_sensor_values_line(const can_master_sensor_values_t *sensors)
-{
-    if (sensors == NULL) return;
-
-    printf("node=%u sensors_deg=[", (unsigned)sensors->node_id);
-    for (size_t i = 0; i < 6U; i++) {
-        if (i > 0) printf(" ");
-        print_fixed_0p1_i16(sensors->values_0p1deg[i], CAN_INFO_VALUE_INVALID_I16);
-    }
-    printf("]\n");
 }
 
 static int cmd_can_nodes(void)
 {
-    print_configured_nodes();
-    return 0;
-}
-
-static int cmd_can_sensors_like(const char *target)
-{
-    uint8_t node = 0;
-    bool all = false;
-    if (!parse_node_or_all(target, &node, &all)) {
-        printf("ERR: invalid node target\n");
-        return 0;
-    }
-
-    if (all) {
-        for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-            can_master_response_t resp = {0};
-            esp_err_t err = can_master_request_status(CONFIGURED_NODE_IDS[i], &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            if (err != ESP_OK) {
-                printf("ERR: node=%u sensors failed (%s)\n", (unsigned)CONFIGURED_NODE_IDS[i], esp_err_to_name(err));
-                continue;
-            }
-
-            can_master_sensor_values_t sensors = {0};
-            err = can_master_wait_sensor_values(CONFIGURED_NODE_IDS[i], &sensors, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            if (err == ESP_OK) {
-                print_sensor_values_line(&sensors);
-            } else {
-                printf("ERR: node=%u sensors failed (%s)\n", (unsigned)CONFIGURED_NODE_IDS[i], esp_err_to_name(err));
-            }
-        }
-        return 0;
-    }
-
-    can_master_response_t resp = {0};
-    esp_err_t err = can_master_request_status(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        printf("ERR: sensors failed (%s)\n", esp_err_to_name(err));
-        return 0;
-    }
-
-    can_master_sensor_values_t sensors = {0};
-    err = can_master_wait_sensor_values(node, &sensors, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err == ESP_OK) {
-        print_sensor_values_line(&sensors);
-    } else {
-        printf("ERR: sensors failed (%s)\n", esp_err_to_name(err));
+    printf("Configured nodes (online timeout %u ms):\n", (unsigned)CAN_MASTER_NODE_ONLINE_TIMEOUT_MS);
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        uint8_t node = CONFIGURED_NODE_IDS[i];
+        printf("  node=%u %s\n",
+               (unsigned)node,
+               can_master_node_is_online(node, CAN_MASTER_NODE_ONLINE_TIMEOUT_MS) ? "online" : "offline");
     }
     return 0;
 }
 
-static int cmd_can_arm_like(bool do_arm, const char *target)
+static int cmd_can_response_like(const char *name, const char *target_arg, node_response_fn_t fn)
 {
-    uint8_t node = 0;
-    bool all = false;
-    if (!parse_node_or_all(target, &node, &all)) {
+    node_target_t target;
+    if (!parse_node_target(target_arg, &target)) {
         printf("ERR: invalid node target\n");
         return 0;
     }
 
-    if (all) {
-        for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-            can_master_response_t resp = {0};
-            esp_err_t err = do_arm
-                ? can_master_arm(CONFIGURED_NODE_IDS[i], &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS)
-                : can_master_disarm(CONFIGURED_NODE_IDS[i], &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            if (err == ESP_OK) {
-                print_response_line(&resp);
-            } else {
-                printf("ERR: node=%u %s failed\n",
-                       (unsigned)CONFIGURED_NODE_IDS[i],
-                       do_arm ? "arm" : "disarm");
-            }
+    for (size_t i = 0; i < target.count; i++) {
+        uint8_t node = target.ids[i];
+        can_master_response_t resp = {0};
+        esp_err_t err = fn(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (err == ESP_OK) {
+            print_response_line(&resp);
+        } else if (target.all) {
+            printf("ERR: node=%u %s failed\n", (unsigned)node, name);
+        } else {
+            printf("ERR: %s failed\n", name);
         }
-        return 0;
-    }
-
-    can_master_response_t resp = {0};
-    esp_err_t err = do_arm
-        ? can_master_arm(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS)
-        : can_master_disarm(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err == ESP_OK) {
-        print_response_line(&resp);
-    } else {
-        printf("ERR: %s failed\n", do_arm ? "arm" : "disarm");
     }
     return 0;
 }
 
-static int cmd_can_home_like(const char *target)
+static int cmd_can_sensors_like(const char *target_arg)
 {
-    uint8_t node = 0;
-    bool all = false;
-    if (!parse_node_or_all(target, &node, &all)) {
+    node_target_t target;
+    if (!parse_node_target(target_arg, &target)) {
         printf("ERR: invalid node target\n");
         return 0;
     }
 
-    if (all) {
-        for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-            can_master_response_t resp = {0};
-            esp_err_t err = can_master_home(CONFIGURED_NODE_IDS[i], &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            if (err == ESP_OK) {
-                print_response_line(&resp);
+    for (size_t i = 0; i < target.count; i++) {
+        uint8_t node = target.ids[i];
+        can_master_response_t resp = {0};
+        esp_err_t err = can_master_request_status(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            if (target.all) {
+                printf("ERR: node=%u sensors failed (%s)\n", (unsigned)node, esp_err_to_name(err));
             } else {
-                printf("ERR: node=%u home failed\n", (unsigned)CONFIGURED_NODE_IDS[i]);
+                printf("ERR: sensors failed (%s)\n", esp_err_to_name(err));
+            }
+            continue;
+        }
+
+        can_master_sensor_values_t sensors = {0};
+        err = can_master_wait_sensor_values(node, &sensors, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (err == ESP_OK) {
+            print_sensor_values_line(&sensors);
+        } else {
+            if (target.all) {
+                printf("ERR: node=%u sensors failed (%s)\n", (unsigned)node, esp_err_to_name(err));
+            } else {
+                printf("ERR: sensors failed (%s)\n", esp_err_to_name(err));
             }
         }
-        return 0;
-    }
-
-    can_master_response_t resp = {0};
-    esp_err_t err = can_master_home(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err == ESP_OK) {
-        print_response_line(&resp);
-    } else {
-        printf("ERR: home failed\n");
     }
     return 0;
 }
 
-static int cmd_can_status_like(const char *target)
+static int cmd_can_status_like(const char *target_arg)
 {
-    uint8_t node = 0;
-    bool all = false;
-    if (!parse_node_or_all(target, &node, &all)) {
+    node_target_t target;
+    if (!parse_node_target(target_arg, &target)) {
         printf("ERR: invalid node target\n");
         return 0;
     }
 
-    if (all) {
-        for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-            can_master_response_t resp = {0};
-            esp_err_t err = can_master_request_status(CONFIGURED_NODE_IDS[i], &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            if (err == ESP_OK) {
-                can_master_work_offset_t work_offset = {0};
-                err = can_master_wait_work_offset(CONFIGURED_NODE_IDS[i], &work_offset, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-                if (err == ESP_OK) {
-                    printf("node=%u armed=%s wcofs=",
-                           (unsigned)CONFIGURED_NODE_IDS[i],
-                           ((resp.state_flags & CAN_STATE_FLAG_ARMED) != 0U) ? "yes" : "no");
-                    print_work_offset_values(work_offset.work_offset_0p1mm);
-                    printf("\n");
-                } else {
-                    printf("node=%u armed=%s wcofs=[n/a n/a n/a]\n",
-                           (unsigned)CONFIGURED_NODE_IDS[i],
-                           ((resp.state_flags & CAN_STATE_FLAG_ARMED) != 0U) ? "yes" : "no");
-                }
-            } else {
-                printf("ERR: node=%u status failed\n", (unsigned)CONFIGURED_NODE_IDS[i]);
-            }
+    for (size_t i = 0; i < target.count; i++) {
+        uint8_t node = target.ids[i];
+        can_master_response_t resp = {0};
+        esp_err_t err = can_master_request_status(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            printf(target.all ? "ERR: node=%u status failed\n" : "ERR: status failed\n", (unsigned)node);
+            continue;
         }
-        return 0;
-    }
 
-    can_master_response_t resp = {0};
-    esp_err_t err = can_master_request_status(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    if (err == ESP_OK) {
         can_master_work_offset_t work_offset = {0};
         err = can_master_wait_work_offset(node, &work_offset, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        printf("node=%u armed=%s wcofs=", (unsigned)node, (resp.state_flags & CAN_STATE_FLAG_ARMED) ? "yes" : "no");
         if (err == ESP_OK) {
-            printf("node=%u armed=%s wcofs=",
-                   (unsigned)node,
-                   ((resp.state_flags & CAN_STATE_FLAG_ARMED) != 0U) ? "yes" : "no");
             print_work_offset_values(work_offset.work_offset_0p1mm);
-            printf("\n");
         } else {
-            printf("node=%u armed=%s wcofs=[n/a n/a n/a]\n",
-                   (unsigned)node,
-                   ((resp.state_flags & CAN_STATE_FLAG_ARMED) != 0U) ? "yes" : "no");
+            printf("[n/a n/a n/a]");
         }
-    } else {
-        printf("ERR: status failed\n");
+        printf("\n");
     }
     return 0;
 }
 
-static int cmd_can_slot_like(const char *op, const char *target, const char *slot_arg)
+static esp_err_t run_slot_op(slot_op_t op, uint8_t node, uint8_t slot, can_master_response_t *resp)
 {
-    uint8_t node = 0;
-    bool all = false;
-    if (!parse_node_or_all(target, &node, &all)) {
+    switch (op) {
+        case SLOT_OP_PREPARE: return can_master_prepare_slot(node, slot, resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        case SLOT_OP_RUN: return can_master_program_run(node, slot, resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        case SLOT_OP_DELETE: return can_master_program_delete(node, slot, resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        case SLOT_OP_UPLOAD:
+            return can_master_upload_gcode_program(node,
+                                                   slot,
+                                                   (const uint8_t *)DEFAULT_GCODE,
+                                                   strlen(DEFAULT_GCODE),
+                                                   CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        default: return ESP_ERR_INVALID_ARG;
+    }
+}
+
+static int cmd_can_slot_like(slot_op_t op, const char *name, const char *target_arg, const char *slot_arg)
+{
+    node_target_t target;
+    uint8_t slot = 0;
+    if (!parse_node_target(target_arg, &target)) {
         printf("ERR: invalid node target\n");
         return 0;
     }
-
-    uint8_t slot = 0;
     if (!parse_slot_arg(slot_arg, &slot)) {
         printf("ERR: invalid slot\n");
         return 0;
     }
-    const bool do_prepare = (strcmp(op, "prepare") == 0);
-    const bool do_run = (strcmp(op, "run") == 0);
-    const bool do_upload = (strcmp(op, "upload") == 0);
-    const bool do_delete = (strcmp(op, "delete") == 0);
-
-    if (do_run && all) {
+    if (op == SLOT_OP_RUN && target.all) {
         printf("WARN: run all starts nodes sequentially, not synchronously. Use prepare all <slot> + sync for synchronized start.\n");
     }
 
-    if (all) {
-        for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-            const uint8_t current_node = CONFIGURED_NODE_IDS[i];
-            can_master_response_t resp = {0};
-            esp_err_t err = ESP_FAIL;
-
-            if (do_prepare) {
-                err = can_master_prepare_slot(current_node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            } else if (do_run) {
-                err = can_master_program_run(current_node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            } else if (do_upload) {
-                err = can_master_upload_gcode_program(current_node,
-                                                      slot,
-                                                      (const uint8_t *)DEFAULT_GCODE,
-                                                      strlen(DEFAULT_GCODE),
-                                                      CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            } else if (do_delete) {
-                err = can_master_program_delete(current_node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            }
-
-            if (err == ESP_OK) {
-                if (do_upload) {
-                    printf("OK: uploaded default G-code to node=%u slot=%u\n",
-                           (unsigned)current_node,
-                           (unsigned)slot);
-                } else {
-                    print_response_line(&resp);
-                }
-            } else {
-                printf("ERR: node=%u %s failed\n", (unsigned)current_node, op);
-            }
-        }
-        return 0;
-    }
-
-    can_master_response_t resp = {0};
-    esp_err_t err = ESP_FAIL;
-    if (do_prepare) {
-        err = can_master_prepare_slot(node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    } else if (do_run) {
-        err = can_master_program_run(node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    } else if (do_upload) {
-        err = can_master_upload_gcode_program(node,
-                                              slot,
-                                              (const uint8_t *)DEFAULT_GCODE,
-                                              strlen(DEFAULT_GCODE),
-                                              CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    } else if (do_delete) {
-        err = can_master_program_delete(node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-    }
-
-    if (err == ESP_OK) {
-        if (do_upload) {
+    for (size_t i = 0; i < target.count; i++) {
+        uint8_t node = target.ids[i];
+        can_master_response_t resp = {0};
+        esp_err_t err = run_slot_op(op, node, slot, &resp);
+        if (err == ESP_OK && op == SLOT_OP_UPLOAD) {
             printf("OK: uploaded default G-code to node=%u slot=%u\n", (unsigned)node, (unsigned)slot);
-        } else {
+        } else if (err == ESP_OK) {
             print_response_line(&resp);
+        } else if (target.all) {
+            printf("ERR: node=%u %s failed\n", (unsigned)node, name);
+        } else {
+            printf("ERR: %s failed\n", name);
         }
-    } else {
-        printf("ERR: %s failed\n", op);
     }
     return 0;
 }
 
-static int cmd_can_upload_file(const char *target, const char *slot_arg, const char *file_arg)
+static int cmd_can_upload_file(const char *target_arg, const char *slot_arg, const char *file_arg)
 {
-    uint8_t node = 0;
-    bool all = false;
-    if (!parse_node_or_all(target, &node, &all)) {
+    node_target_t target;
+    uint8_t slot = 0;
+    char path[160] = {0};
+
+    if (!parse_node_target(target_arg, &target)) {
         printf("ERR: invalid node target\n");
         return 0;
     }
-
-    uint8_t slot = 0;
     if (!parse_slot_arg(slot_arg, &slot)) {
         printf("ERR: invalid slot\n");
         return 0;
     }
-
-    char path[160] = {0};
     if (!normalize_spiffs_path(file_arg, path, sizeof(path))) {
         printf("ERR: invalid path\n");
         return 0;
@@ -833,39 +625,21 @@ static int cmd_can_upload_file(const char *target, const char *slot_arg, const c
 
     uint8_t *file_data = NULL;
     size_t file_size = 0;
-    esp_err_t load_err = load_file_from_spiffs(path, &file_data, &file_size);
-    if (load_err != ESP_OK) {
-        printf("ERR: read %s failed (%s)\n", path, esp_err_to_name(load_err));
+    esp_err_t err = load_file_from_spiffs(path, &file_data, &file_size);
+    if (err != ESP_OK) {
+        printf("ERR: read %s failed (%s)\n", path, esp_err_to_name(err));
         printf("Hint: put your file into SPIFFS image under spiffs/data.\n");
         return 0;
     }
 
     printf("Loaded %s (%u bytes)\n", path, (unsigned)file_size);
-
-    if (all) {
-        for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-            const uint8_t current_node = CONFIGURED_NODE_IDS[i];
-            esp_err_t err = can_master_upload_gcode_program(current_node,
-                                                            slot,
-                                                            file_data,
-                                                            file_size,
-                                                            CAN_MASTER_RESPONSE_TIMEOUT_MS);
-            if (err == ESP_OK) {
-                printf("OK: uploaded %s to node=%u slot=%u\n", path, (unsigned)current_node, (unsigned)slot);
-            } else {
-                printf("ERR: node=%u upload_file failed\n", (unsigned)current_node);
-            }
-        }
-    } else {
-        esp_err_t err = can_master_upload_gcode_program(node,
-                                                        slot,
-                                                        file_data,
-                                                        file_size,
-                                                        CAN_MASTER_RESPONSE_TIMEOUT_MS);
+    for (size_t i = 0; i < target.count; i++) {
+        uint8_t node = target.ids[i];
+        err = can_master_upload_gcode_program(node, slot, file_data, file_size, CAN_MASTER_RESPONSE_TIMEOUT_MS);
         if (err == ESP_OK) {
             printf("OK: uploaded %s to node=%u slot=%u\n", path, (unsigned)node, (unsigned)slot);
         } else {
-            printf("ERR: upload_file failed\n");
+            printf(target.all ? "ERR: node=%u upload_file failed\n" : "ERR: upload_file failed\n", (unsigned)node);
         }
     }
 
@@ -873,27 +647,60 @@ static int cmd_can_upload_file(const char *target, const char *slot_arg, const c
     return 0;
 }
 
+static esp_err_t upload_program_all(uint8_t slot, const char *label, const uint8_t *program, size_t program_size)
+{
+    if (label == NULL || program == NULL || program_size == 0U) return ESP_ERR_INVALID_ARG;
+
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        uint8_t node = CONFIGURED_NODE_IDS[i];
+        printf("%s: upload node=%u slot=%u\n", label, (unsigned)node, (unsigned)slot);
+        can_master_clear_pending_responses();
+        esp_err_t err = can_master_upload_gcode_program(node, slot, program, program_size, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (err != ESP_OK) {
+            printf("ERR: node=%u upload failed (%s)\n", (unsigned)node, esp_err_to_name(err));
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_master_clear_pending_responses();
+    }
+    return ESP_OK;
+}
+
+static esp_err_t prepare_all(uint8_t slot, const char *label)
+{
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        uint8_t node = CONFIGURED_NODE_IDS[i];
+        can_master_response_t resp = {0};
+        can_master_clear_pending_responses();
+        printf("%s: prepare node=%u slot=%u\n", label, (unsigned)node, (unsigned)slot);
+        esp_err_t err = can_master_prepare_slot(node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (resp.node_id != 0U) print_response_line(&resp);
+        if (err != ESP_OK) {
+            printf("ERR: node=%u prepare failed (%s)\n", (unsigned)node, esp_err_to_name(err));
+            return err;
+        }
+    }
+    return ESP_OK;
+}
+
 static int cmd_can_run_sync(int argc, char **argv)
 {
-    uint8_t node = 0;
-    bool all = false;
-    if (!parse_node_or_all(argv[2], &node, &all)) {
+    node_target_t target;
+    if (!parse_node_target(argv[2], &target)) {
         printf("ERR: invalid node target\n");
         return 0;
     }
-
-    if (!all) {
+    if (!target.all) {
         printf("ERR: run_sync supports only `all`; use `can run <node> <slot>` for one node\n");
         return 0;
     }
 
     uint8_t slot = RUN_SYNC_DEFAULT_SLOT;
+    char path[160] = {0};
     if (argc == 5 && !parse_slot_arg(argv[4], &slot)) {
         printf("ERR: invalid slot\n");
         return 0;
     }
-
-    char path[160] = {0};
     if (!normalize_spiffs_path(argv[3], path, sizeof(path))) {
         printf("ERR: invalid path\n");
         return 0;
@@ -908,68 +715,27 @@ static int cmd_can_run_sync(int argc, char **argv)
         return 0;
     }
 
-    printf("RUN_SYNC: loaded %s (%u bytes), slot=%u\n",
-           path,
-           (unsigned)file_size,
-           (unsigned)slot);
-
-    can_master_clear_pending_responses();
-    (void)can_master_stop_all();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    can_master_clear_pending_responses();
+    printf("RUN_SYNC: loaded %s (%u bytes), slot=%u\n", path, (unsigned)file_size, (unsigned)slot);
+    (void)stop_all_flushed(100);
 
     for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-        const uint8_t current_node = CONFIGURED_NODE_IDS[i];
+        uint8_t node = CONFIGURED_NODE_IDS[i];
         can_master_response_t resp = {0};
-
-        printf("RUN_SYNC: arm node=%u\n", (unsigned)current_node);
-        err = can_master_arm(current_node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-        if (resp.node_id != 0U) {
-            print_response_line(&resp);
-        }
+        printf("RUN_SYNC: arm node=%u\n", (unsigned)node);
+        err = can_master_arm(node, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        if (resp.node_id != 0U) print_response_line(&resp);
         if (err != ESP_OK) {
-            printf("ERR: node=%u arm failed (%s)\n", (unsigned)current_node, esp_err_to_name(err));
+            printf("ERR: node=%u arm failed (%s)\n", (unsigned)node, esp_err_to_name(err));
             free(file_data);
             return 0;
         }
     }
 
-    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-        const uint8_t current_node = CONFIGURED_NODE_IDS[i];
-
-        can_master_clear_pending_responses();
-        printf("RUN_SYNC: upload node=%u slot=%u\n", (unsigned)current_node, (unsigned)slot);
-        err = can_master_upload_gcode_program(current_node,
-                                              slot,
-                                              file_data,
-                                              file_size,
-                                              CAN_MASTER_RESPONSE_TIMEOUT_MS);
-        if (err != ESP_OK) {
-            printf("ERR: node=%u upload failed (%s)\n", (unsigned)current_node, esp_err_to_name(err));
-            free(file_data);
-            return 0;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-        can_master_clear_pending_responses();
-    }
-
+    err = upload_program_all(slot, "RUN_SYNC", file_data, file_size);
     free(file_data);
+    if (err != ESP_OK) return 0;
 
-    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-        const uint8_t current_node = CONFIGURED_NODE_IDS[i];
-        can_master_response_t resp = {0};
-
-        can_master_clear_pending_responses();
-        printf("RUN_SYNC: prepare node=%u slot=%u\n", (unsigned)current_node, (unsigned)slot);
-        err = can_master_prepare_slot(current_node, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-        if (resp.node_id != 0U) {
-            print_response_line(&resp);
-        }
-        if (err != ESP_OK) {
-            printf("ERR: node=%u prepare failed (%s)\n", (unsigned)current_node, esp_err_to_name(err));
-            return 0;
-        }
-    }
+    if (prepare_all(slot, "RUN_SYNC") != ESP_OK) return 0;
 
     can_master_clear_pending_responses();
     printf("RUN_SYNC: sync start\n");
@@ -982,123 +748,40 @@ static int cmd_can_seq(int argc, char **argv)
 {
     uint8_t slot = 0;
     char slot_text[8] = "0";
-    if (argc == 3) {
-        char *end = NULL;
-        unsigned long parsed_slot = strtoul(argv[2], &end, 0);
-        if (end == argv[2] || *end != '\0' || parsed_slot >= CAN_PROGRAM_SLOT_COUNT) {
-            printf("ERR: invalid slot\n");
-            return 0;
-        }
-        slot = (uint8_t)parsed_slot;
+    if (argc == 3 && !parse_slot_arg(argv[2], &slot)) {
+        printf("ERR: invalid slot\n");
+        return 0;
     }
     snprintf(slot_text, sizeof(slot_text), "%u", (unsigned)slot);
 
     printf("SEQ: arm all\n");
-    (void)cmd_can_arm_like(true, "all");
+    (void)cmd_can_response_like("arm", "all", can_master_arm);
     printf("SEQ: upload all slot=%u\n", (unsigned)slot);
-    (void)cmd_can_slot_like("upload", "all", slot_text);
+    (void)cmd_can_slot_like(SLOT_OP_UPLOAD, "upload", "all", slot_text);
     printf("SEQ: prepare all slot=%u\n", (unsigned)slot);
-    (void)cmd_can_slot_like("prepare", "all", slot_text);
+    (void)cmd_can_slot_like(SLOT_OP_PREPARE, "prepare", "all", slot_text);
     printf("SEQ: sync\n");
     esp_err_t err = can_master_sync_start_all();
     printf(err == ESP_OK ? "OK: sync start sent\n" : "ERR: sync start failed\n");
     return 0;
 }
 
-static bool parse_sync_measure_duration_arg(const char *arg, uint32_t *out_duration_ms)
-{
-    if (arg == NULL || out_duration_ms == NULL) {
-        return false;
-    }
-
-    char *end = NULL;
-    unsigned long parsed_ms = strtoul(arg, &end, 0);
-    if (end == arg || *end != '\0' ||
-        parsed_ms < SYNC_MEASURE_MIN_DURATION_MS ||
-        parsed_ms > SYNC_MEASURE_MAX_DURATION_MS) {
-        return false;
-    }
-
-    *out_duration_ms = (uint32_t)parsed_ms;
-    return true;
-}
-
-static esp_err_t sync_measure_upload_program_all(uint8_t slot, const char *label, const char *program)
-{
-    if (label == NULL || program == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-        const uint8_t node_id = CONFIGURED_NODE_IDS[i];
-        printf("MEASURE_SYNC: upload %s node=%u slot=%u\n",
-               label,
-               (unsigned)node_id,
-               (unsigned)slot);
-
-        can_master_clear_pending_responses();
-        esp_err_t err = can_master_upload_gcode_program(node_id,
-                                                        slot,
-                                                        (const uint8_t *)program,
-                                                        strlen(program),
-                                                        CAN_MASTER_RESPONSE_TIMEOUT_MS);
-        if (err != ESP_OK) {
-            printf("ERR: node=%u upload %s failed (%s)\n",
-                   (unsigned)node_id,
-                   label,
-                   esp_err_to_name(err));
-            return err;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(50));
-        can_master_clear_pending_responses();
-    }
-
-    return ESP_OK;
-}
-
-static esp_err_t sync_measure_prepare_all(uint8_t slot)
-{
-    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
-        const uint8_t node_id = CONFIGURED_NODE_IDS[i];
-        can_master_response_t resp = {0};
-
-        can_master_clear_pending_responses();
-        printf("MEASURE_SYNC: prepare node=%u slot=%u\n", (unsigned)node_id, (unsigned)slot);
-        esp_err_t err = can_master_prepare_slot(node_id, slot, &resp, CAN_MASTER_RESPONSE_TIMEOUT_MS);
-        if (resp.node_id != 0U) {
-            print_response_line(&resp);
-        }
-        if (err != ESP_OK) {
-            printf("ERR: node=%u prepare failed (%s)\n", (unsigned)node_id, esp_err_to_name(err));
-            return err;
-        }
-    }
-
-    return ESP_OK;
-}
-
 static int cmd_can_measure_sync(int argc, char **argv)
 {
     uint32_t duration_ms = SYNC_MEASURE_DEFAULT_DURATION_MS;
-    if (argc == 3 && !parse_sync_measure_duration_arg(argv[2], &duration_ms)) {
+    if (argc == 3 &&
+        !parse_u32_arg(argv[2], SYNC_MEASURE_MIN_DURATION_MS, SYNC_MEASURE_MAX_DURATION_MS, &duration_ms)) {
         printf("ERR: invalid duration_ms, use %u..%u\n",
                (unsigned)SYNC_MEASURE_MIN_DURATION_MS,
                (unsigned)SYNC_MEASURE_MAX_DURATION_MS);
         return 0;
     }
 
-    const unsigned gripper_angle_deg = s_sync_measure_close_next ? 0U : 90U;
-    char measure_gcode[SYNC_MEASURE_GCODE_BUFFER_SIZE] = {0};
     const uint32_t dwell_ms = duration_ms + SYNC_MEASURE_STOP_MARGIN_MS;
+    char measure_gcode[SYNC_MEASURE_GCODE_BUFFER_SIZE] = {0};
     int written = snprintf(measure_gcode,
                            sizeof(measure_gcode),
-                           "G21\n"
-                           "G90\n"
-                           "M280 S%u\n"
-                           "G4 P%u\n"
-                           "M30\n",
-                           gripper_angle_deg,
+                           "G21\nG90\nG4 P%u\nM30\n",
                            (unsigned)dwell_ms);
     if (written <= 0 || (size_t)written >= sizeof(measure_gcode)) {
         printf("ERR: measure G-code build failed\n");
@@ -1106,17 +789,10 @@ static int cmd_can_measure_sync(int argc, char **argv)
     }
 
     printf("MEASURE_SYNC: one-shot setup uses slot=%u and overwrites it\n", (unsigned)SYNC_MEASURE_SLOT);
-    printf("MEASURE_SYNC: target gripper angle S%u (next run toggles)\n", gripper_angle_deg);
-
-    esp_err_t err = ESP_OK;
-
-    can_master_clear_pending_responses();
-    (void)can_master_stop_all();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    can_master_clear_pending_responses();
+    (void)stop_all_flushed(100);
 
     printf("MEASURE_SYNC: broadcast ARM\n");
-    err = can_master_arm_all();
+    esp_err_t err = can_master_arm_all();
     if (err != ESP_OK) {
         printf("ERR: arm all failed (%s)\n", esp_err_to_name(err));
         return 0;
@@ -1124,15 +800,8 @@ static int cmd_can_measure_sync(int argc, char **argv)
     vTaskDelay(pdMS_TO_TICKS(100));
     can_master_clear_pending_responses();
 
-    err = sync_measure_upload_program_all(SYNC_MEASURE_SLOT, "measure", measure_gcode);
-    if (err != ESP_OK) {
-        return 0;
-    }
-
-    err = sync_measure_prepare_all(SYNC_MEASURE_SLOT);
-    if (err != ESP_OK) {
-        return 0;
-    }
+    if (upload_program_all(SYNC_MEASURE_SLOT, "MEASURE_SYNC", (const uint8_t *)measure_gcode, strlen(measure_gcode)) != ESP_OK) return 0;
+    if (prepare_all(SYNC_MEASURE_SLOT, "MEASURE_SYNC") != ESP_OK) return 0;
 
     can_master_clear_pending_responses();
     printf("MEASURE_SYNC: t=0 ms send SYNC_START\n");
@@ -1143,14 +812,10 @@ static int cmd_can_measure_sync(int argc, char **argv)
     }
 
     vTaskDelay(pdMS_TO_TICKS(duration_ms));
-
     printf("MEASURE_SYNC: t=%u ms send DISARM\n", (unsigned)duration_ms);
     err = can_master_disarm_all();
     vTaskDelay(pdMS_TO_TICKS(50));
     can_master_clear_pending_responses();
-    if (err == ESP_OK) {
-        s_sync_measure_close_next = !s_sync_measure_close_next;
-    }
     printf(err == ESP_OK ? "OK: measure_sync finished\n" : "ERR: disarm failed\n");
     return 0;
 }
@@ -1158,41 +823,30 @@ static int cmd_can_measure_sync(int argc, char **argv)
 static esp_err_t relay_execute_cycles(uint32_t cycles)
 {
     static const relay_step_t relay_steps[] = {
-        { CAN_MASTER_NODE2_ID, RELAY_NODE2_FORWARD_SLOT, "node2 slot0: HOME -> pick A -> place B -> HOME" },
-        { CAN_MASTER_NODE1_ID, RELAY_NODE1_FORWARD_SLOT, "node1 slot0: HOME -> pick B -> place C -> HOME" },
-        { CAN_MASTER_NODE1_ID, RELAY_NODE1_RETURN_SLOT, "node1 slot1: pick C -> place B -> HOME" },
-        { CAN_MASTER_NODE2_ID, RELAY_NODE2_RETURN_SLOT, "node2 slot1: pick B -> place A -> HOME" },
+        {CAN_MASTER_NODE2_ID, RELAY_FORWARD_SLOT, "node2 forward: HOME -> pick A -> place B -> HOME"},
+        {CAN_MASTER_NODE1_ID, RELAY_FORWARD_SLOT, "node1 forward: HOME -> pick B -> place C -> HOME"},
+        {CAN_MASTER_NODE1_ID, RELAY_RETURN_SLOT,  "node1 return:  pick C -> place B -> HOME"},
+        {CAN_MASTER_NODE2_ID, RELAY_RETURN_SLOT,  "node2 return:  pick B -> place A -> HOME"},
     };
 
-    printf("RELAY: arm + home node=%u\n", (unsigned)CAN_MASTER_NODE1_ID);
-    esp_err_t err = relay_arm_and_home_node(CAN_MASTER_NODE1_ID);
-    if (err != ESP_OK) {
-        return err;
+    for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
+        uint8_t node = CONFIGURED_NODE_IDS[i];
+        printf("RELAY: arm + home node=%u\n", (unsigned)node);
+        esp_err_t err = relay_arm_and_home_node(node);
+        if (err != ESP_OK) return err;
     }
 
-    printf("RELAY: arm + home node=%u\n", (unsigned)CAN_MASTER_NODE2_ID);
-    err = relay_arm_and_home_node(CAN_MASTER_NODE2_ID);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = relay_broadcast_home_all();
-    if (err != ESP_OK) {
-        return err;
-    }
+    esp_err_t err = relay_broadcast_home_all();
+    if (err != ESP_OK) return err;
 
     for (uint32_t cycle = 0; cycle < cycles; cycle++) {
-        if (relay_stop_requested()) {
-            return ESP_ERR_INVALID_STATE;
-        }
-
+        if (relay_stop_requested()) return ESP_ERR_INVALID_STATE;
         relay_set_cycle_progress(cycle + 1U);
         printf("RELAY: cycle %" PRIu32 "/%" PRIu32 "\n", cycle + 1U, cycles);
-        for (size_t i = 0; i < sizeof(relay_steps) / sizeof(relay_steps[0]); i++) {
+
+        for (size_t i = 0; i < ARRAY_SIZE(relay_steps); i++) {
             err = relay_run_step(&relay_steps[i]);
-            if (err != ESP_OK) {
-                return relay_stop_requested() ? ESP_ERR_INVALID_STATE : err;
-            }
+            if (err != ESP_OK) return relay_stop_requested() ? ESP_ERR_INVALID_STATE : err;
         }
     }
 
@@ -1202,22 +856,13 @@ static esp_err_t relay_execute_cycles(uint32_t cycles)
 
 static void relay_task(void *arg)
 {
-    const uint32_t cycles = (uint32_t)(uintptr_t)arg;
-    const esp_err_t err = relay_execute_cycles(cycles);
-
+    esp_err_t err = relay_execute_cycles((uint32_t)(uintptr_t)arg);
     if (err == ESP_ERR_INVALID_STATE && relay_stop_requested()) {
         printf("RELAY: stopped\n");
     } else if (err != ESP_OK) {
         printf("ERR: relay aborted (%s)\n", esp_err_to_name(err));
     }
-
-    taskENTER_CRITICAL(&s_relay_mux);
-    s_relay_running = false;
-    s_relay_stop_requested = false;
-    s_relay_target_cycles = 0;
-    s_relay_active_cycle = 0;
-    taskEXIT_CRITICAL(&s_relay_mux);
-
+    relay_set_state(false, false, 0, 0);
     vTaskDelete(NULL);
 }
 
@@ -1240,43 +885,29 @@ static int cmd_can_relay_status(void)
 
 static int cmd_can_relay(int argc, char **argv)
 {
-    if (argc == 3 && strcmp(argv[2], "status") == 0) {
-        return cmd_can_relay_status();
-    }
-
+    if (argc == 3 && strcmp(argv[2], "status") == 0) return cmd_can_relay_status();
     if (argc == 3 && strcmp(argv[2], "stop") == 0) {
         if (!relay_is_running()) {
             printf("RELAY: idle\n");
             return 0;
         }
-
         relay_request_stop();
-        can_master_clear_pending_responses();
-        esp_err_t err = can_master_stop_all();
-        vTaskDelay(pdMS_TO_TICKS(50));
-        can_master_clear_pending_responses();
+        esp_err_t err = stop_all_flushed(50);
         printf(err == ESP_OK ? "OK: relay stop requested\n" : "ERR: relay stop failed\n");
         return 0;
     }
 
     uint32_t cycles = 1;
-    if (argc == 3 && !parse_cycle_count_arg(argv[2], &cycles)) {
+    if (argc == 3 && !parse_u32_arg(argv[2], 1U, 100000U, &cycles)) {
         printf("ERR: invalid cycle count\n");
         return 0;
     }
-
     if (relay_is_running()) {
         printf("ERR: relay is already running\n");
         return 0;
     }
 
-    taskENTER_CRITICAL(&s_relay_mux);
-    s_relay_running = true;
-    s_relay_stop_requested = false;
-    s_relay_target_cycles = cycles;
-    s_relay_active_cycle = 0;
-    taskEXIT_CRITICAL(&s_relay_mux);
-
+    relay_set_state(true, false, cycles, 0);
     BaseType_t created = xTaskCreate(relay_task,
                                      "relay_task",
                                      RELAY_TASK_STACK_SIZE,
@@ -1284,12 +915,7 @@ static int cmd_can_relay(int argc, char **argv)
                                      RELAY_TASK_PRIORITY,
                                      NULL);
     if (created != pdPASS) {
-        taskENTER_CRITICAL(&s_relay_mux);
-        s_relay_running = false;
-        s_relay_stop_requested = false;
-        s_relay_target_cycles = 0;
-        s_relay_active_cycle = 0;
-        taskEXIT_CRITICAL(&s_relay_mux);
+        relay_set_state(false, false, 0, 0);
         printf("ERR: relay task start failed\n");
         return 0;
     }
@@ -1298,160 +924,84 @@ static int cmd_can_relay(int argc, char **argv)
     return 0;
 }
 
+static int usage(const char *text)
+{
+    printf("Usage: %s\n", text);
+    return 0;
+}
+
 static int cmd_can(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage:\n");
-        printf("  can init\n");
-        printf("  can nodes\n");
-        printf("  can arm <node|all>\n");
-        printf("  can disarm <node|all>\n");
-        printf("  can home <node|all>\n");
-        printf("  can status <node|all>\n");
-        printf("  can sensors <node|all>\n");
-        printf("  can prepare <node|all> <slot>\n");
-        printf("  can run <node|all> <slot>\n");
-        printf("  can run_sync all <path> [slot]   (loads /spiffs/<path>, default slot 0)\n");
-        printf("  can delete <node|all> <slot>\n");
-        printf("  can stop\n");
-        printf("  can sync\n");
-        printf("  can measure_sync [duration_ms]\n");
-        printf("  can upload <node|all> <slot>   (uploads DEFAULT_GCODE)\n");
-        printf("  can upload_file <node|all> <slot> <path>   (loads /spiffs/<path>)\n");
-        printf("  can seq [slot]\n");
-        printf("  can relay [cycles]\n");
-        printf("  can relay status\n");
-        printf("  can relay stop\n");
+        printf("%s", CAN_USAGE);
         return 0;
     }
 
-    if (strcmp(argv[1], "nodes") == 0) {
-        return cmd_can_nodes();
-    }
-
-    if (strcmp(argv[1], "stop") == 0) {
-        if (relay_is_running()) {
-            relay_request_stop();
-        }
-
-        can_master_clear_pending_responses();
-        esp_err_t err = can_master_stop_all();
-        vTaskDelay(pdMS_TO_TICKS(50));
-        can_master_clear_pending_responses();
+    const char *cmd = argv[1];
+    if (strcmp(cmd, "nodes") == 0) return cmd_can_nodes();
+    if (strcmp(cmd, "stop") == 0) {
+        if (relay_is_running()) relay_request_stop();
+        esp_err_t err = stop_all_flushed(50);
         printf(err == ESP_OK
                    ? (relay_is_running() ? "OK: stop sent, relay stop requested\n" : "OK: stop sent\n")
                    : "ERR: stop failed\n");
         return 0;
     }
-
-    if (strcmp(argv[1], "relay") == 0) {
-        if (argc != 2 && argc != 3) {
-            printf("Usage: can relay [cycles]\n");
-            printf("       can relay status\n");
-            printf("       can relay stop\n");
-            return 0;
-        }
+    if (strcmp(cmd, "relay") == 0) {
+        if (argc != 2 && argc != 3) return usage("can relay [cycles]\n       can relay status\n       can relay stop");
         return cmd_can_relay(argc, argv);
     }
-
     if (relay_is_running()) {
         printf("ERR: relay is running; use `can relay status` or `can stop`\n");
         return 0;
     }
 
-    if (strcmp(argv[1], "init") == 0) {
+    if (strcmp(cmd, "init") == 0) {
         esp_err_t err = can_master_init();
-        if (err == ESP_OK) {
-            printf("OK: can init\n");
-        } else {
-            printf("ERR: can init failed (%s)\n", esp_err_to_name(err));
-        }
+        printf(err == ESP_OK ? "OK: can init\n" : "ERR: can init failed (%s)\n", esp_err_to_name(err));
         return 0;
     }
-
-    if (strcmp(argv[1], "sync") == 0) {
+    if (strcmp(cmd, "sync") == 0) {
         esp_err_t err = can_master_sync_start_all();
         printf(err == ESP_OK ? "OK: sync start sent\n" : "ERR: sync start failed\n");
         return 0;
     }
-
-    if (strcmp(argv[1], "measure_sync") == 0) {
-        if (argc != 2 && argc != 3) {
-            printf("Usage: can measure_sync [duration_ms]\n");
-            return 0;
-        }
+    if (strcmp(cmd, "measure_sync") == 0) {
+        if (argc != 2 && argc != 3) return usage("can measure_sync [duration_ms]");
         return cmd_can_measure_sync(argc, argv);
     }
-
-    if (strcmp(argv[1], "run_sync") == 0) {
-        if (argc != 4 && argc != 5) {
-            printf("Usage: can run_sync all <path> [slot]\n");
-            return 0;
-        }
+    if (strcmp(cmd, "run_sync") == 0) {
+        if (argc != 4 && argc != 5) return usage("can run_sync all <path> [slot]");
         return cmd_can_run_sync(argc, argv);
     }
-
-    if (strcmp(argv[1], "seq") == 0) {
-        if (argc != 2 && argc != 3) {
-            printf("Usage: can seq [slot]\n");
-            return 0;
-        }
+    if (strcmp(cmd, "seq") == 0) {
+        if (argc != 2 && argc != 3) return usage("can seq [slot]");
         return cmd_can_seq(argc, argv);
     }
-
-    if (strcmp(argv[1], "arm") == 0 || strcmp(argv[1], "disarm") == 0) {
-        if (argc != 3) {
-            printf("Usage: can %s <node|all>\n", argv[1]);
-            return 0;
-        }
-        return cmd_can_arm_like(strcmp(argv[1], "arm") == 0, argv[2]);
+    if (strcmp(cmd, "arm") == 0 || strcmp(cmd, "disarm") == 0 || strcmp(cmd, "home") == 0) {
+        if (argc != 3) return usage(strcmp(cmd, "home") == 0 ? "can home <node|all>" : "can <arm|disarm> <node|all>");
+        node_response_fn_t fn = strcmp(cmd, "arm") == 0 ? can_master_arm : strcmp(cmd, "home") == 0 ? can_master_home : can_master_disarm;
+        return cmd_can_response_like(cmd, argv[2], fn);
     }
-
-    if (strcmp(argv[1], "home") == 0) {
-        if (argc != 3) {
-            printf("Usage: can home <node|all>\n");
-            return 0;
-        }
-        return cmd_can_home_like(argv[2]);
-    }
-
-    if (strcmp(argv[1], "status") == 0) {
-        if (argc != 3) {
-            printf("Usage: can status <node|all>\n");
-            return 0;
-        }
+    if (strcmp(cmd, "status") == 0) {
+        if (argc != 3) return usage("can status <node|all>");
         return cmd_can_status_like(argv[2]);
     }
-
-    if (strcmp(argv[1], "sensors") == 0) {
-        if (argc != 3) {
-            printf("Usage: can sensors <node|all>\n");
-            return 0;
-        }
+    if (strcmp(cmd, "sensors") == 0) {
+        if (argc != 3) return usage("can sensors <node|all>");
         return cmd_can_sensors_like(argv[2]);
     }
-
-    if (strcmp(argv[1], "prepare") == 0 || strcmp(argv[1], "run") == 0 || strcmp(argv[1], "delete") == 0) {
-        if (argc != 4) {
-            printf("Usage: can %s <node|all> <slot>\n", argv[1]);
-            return 0;
-        }
-        return cmd_can_slot_like(argv[1], argv[2], argv[3]);
+    if (strcmp(cmd, "prepare") == 0 || strcmp(cmd, "run") == 0 || strcmp(cmd, "delete") == 0) {
+        if (argc != 4) return usage("can <prepare|run|delete> <node|all> <slot>");
+        slot_op_t op = strcmp(cmd, "prepare") == 0 ? SLOT_OP_PREPARE : strcmp(cmd, "run") == 0 ? SLOT_OP_RUN : SLOT_OP_DELETE;
+        return cmd_can_slot_like(op, cmd, argv[2], argv[3]);
     }
-
-    if (strcmp(argv[1], "upload") == 0) {
-        if (argc != 4) {
-            printf("Usage: can upload <node|all> <slot>\n");
-            return 0;
-        }
-        return cmd_can_slot_like("upload", argv[2], argv[3]);
+    if (strcmp(cmd, "upload") == 0) {
+        if (argc != 4) return usage("can upload <node|all> <slot>");
+        return cmd_can_slot_like(SLOT_OP_UPLOAD, "upload", argv[2], argv[3]);
     }
-
-    if (strcmp(argv[1], "upload_file") == 0) {
-        if (argc != 5) {
-            printf("Usage: can upload_file <node|all> <slot> <path>\n");
-            return 0;
-        }
+    if (strcmp(cmd, "upload_file") == 0) {
+        if (argc != 5) return usage("can upload_file <node|all> <slot> <path>");
         return cmd_can_upload_file(argv[2], argv[3], argv[4]);
     }
 
@@ -1461,20 +1011,13 @@ static int cmd_can(int argc, char **argv)
 
 static void register_commands(void)
 {
-    const esp_console_cmd_t cmds[] = {
-        { .command = "can", .help = "CAN master control", .func = &cmd_can },
-    };
-
-    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
-        esp_console_cmd_t c = cmds[i];
-        c.hint = NULL;
-        c.argtable = NULL;
-        ESP_ERROR_CHECK(esp_console_cmd_register(&c));
-    }
+    esp_console_cmd_t cmd = {.command = "can", .help = "CAN master control", .hint = NULL, .argtable = NULL, .func = &cmd_can};
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 }
 
 void cmd_control_start(void)
 {
+    esp_console_repl_t *s_repl = NULL;
     esp_console_repl_config_t repl_cfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_cfg.prompt = ">> ";
     repl_cfg.max_history_len = 10;
@@ -1482,7 +1025,6 @@ void cmd_control_start(void)
     repl_cfg.task_stack_size = 4096;
 
     esp_err_t err = ESP_OK;
-
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
     esp_console_dev_usb_serial_jtag_config_t usb_cfg = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
     err = esp_console_new_repl_usb_serial_jtag(&usb_cfg, &repl_cfg, &s_repl);
@@ -1496,7 +1038,6 @@ void cmd_control_start(void)
     }
 
     register_commands();
-
     linenoiseSetDumbMode(1);
     linenoiseSetMultiLine(0);
 
@@ -1505,6 +1046,5 @@ void cmd_control_start(void)
         ESP_LOGE(TAG, "console REPL start failed: %s", esp_err_to_name(err));
         return;
     }
-
     ESP_LOGI(TAG, "console REPL started");
 }
