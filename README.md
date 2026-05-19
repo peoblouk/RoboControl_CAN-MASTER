@@ -1,6 +1,6 @@
 ﻿# CAN Master (ESP-IDF + MCP2515)
 
-Jednoduchy CAN master pro ESP32-C3. Po startu inicializuje CAN, spusti konzoli a umozni ovladat roboticke nody pres prikaz `can`.
+CAN master pro ESP32-C3. Po startu inicializuje CAN, spusti konzoli a umozni ovladat roboticke nody pres prikaz `can`.
 
 ## Build / flash
 
@@ -9,7 +9,7 @@ idf.py set-target esp32c3
 idf.py -p PORT build flash monitor
 ```
 
-Po pripojeni monitoru zadavej prikazy do konzole (`>>`).
+Po připojení monitoru lze zadat příkazy do konzole (`>>`).
 
 ## Implementovane prikazy
 
