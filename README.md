@@ -1,17 +1,32 @@
-﻿# CAN Master (ESP-IDF + MCP2515)
+# CAN Master
 
-Jednoduchy CAN master pro ESP32-C3. Po startu inicializuje CAN, spusti konzoli a umozni ovladat roboticke nody pres prikaz `can`.
+ESP-IDF aplikace pro ESP32-C3 (Stamp-C3U) s MCP2515. Po startu inicializuje NVS, připojí SPIFFS, spustí CAN master a konzoli s příkazem `can`. Na pozadí běží status LED indikující stav uzlů.
 
-## Build / flash
+## Hardware
+
+| Signál | GPIO |
+|--------|------|
+| SCK    | 4    |
+| MISO   | 5    |
+| MOSI   | 6    |
+| CS     | 7    |
+| INT    | 10   |
+
+- MCP2515 oscilátor: 8 MHz
+- CAN bitrate: 500 kbps
+- Uzly: ID 0x01, 0x02
+- Programové sloty na uzel: 4 (0–3)
+
+## Build / Flash
 
 ```bash
 idf.py set-target esp32c3
 idf.py -p PORT build flash monitor
 ```
 
-Po pripojeni monitoru zadavej prikazy do konzole (`>>`).
+SPIFFS image se sestaví z adresáře `spiffs/`. Soubor `spiffs/example.gcode` je na zařízení dostupný jako `/spiffs/example.gcode`.
 
-## Implementovane prikazy
+## Příkazy
 
 ```text
 can init
@@ -23,146 +38,92 @@ can status <node|all>
 can sensors <node|all>
 can prepare <node|all> <slot>
 can run <node|all> <slot>
-can run_sync all <path> [slot]   (nahraje /spiffs/<path>, pripravi all a posle sync)
+can run_sync all <path> [slot]
 can delete <node|all> <slot>
-can upload <node|all> <slot>   (nahraje DEFAULT_GCODE)
-can upload_file <node|all> <slot> <path>   (nahraje /spiffs/<path>)
 can stop
 can sync
 can measure_sync [duration_ms]
+can upload <node|all> <slot>
+can upload_file <node|all> <slot> <path>
 can seq [slot]
 can relay [cycles]
 can relay status
 can relay stop
 ```
 
-## Kratke priklady
+## Příklady
+
+Základní sekvence:
 
 ```text
+can nodes
 can arm all
-can run_sync all example.gcode
-can measure_sync
-can upload_file all 0 example.gcode
-can sensors all
-```
-
-Pro synchronizovany start programu ze SPIFFS staci:
-
-```text
 can home all
-can run_sync all example.gcode
+can upload_file all 0 example.gcode
+can prepare all 0
+can sync
 ```
 
-`run_sync` pouzije slot 0, pokud slot nezadas. Jiny slot napr.:
+Synchronizovaný start programu ze SPIFFS:
 
 ```text
+can run_sync all example.gcode
 can run_sync all example.gcode 1
 ```
 
-## Mereni synchronizace start/stop
+`run_sync` podporuje jen `all`; pokud slot nezadáš, použije se slot `0`.
 
-Pro mereni odezvy uzlu na `SYNC_START` staci jeden prikaz:
+## Příkaz seq
 
 ```text
-can measure_sync
+can seq [slot]
 ```
 
-Prikaz automaticky:
+Zkratka pro ruční testování. Provede `arm all`, nahraje výchozí G-kód na zadaný slot (výchozí `0`), připraví uzly a odešle `SYNC_START`.
 
-1. zastavi pripadny beh,
-2. zapne serva pres broadcast `ARM`,
-3. nahraje merici program do slotu 3 na obou uzlech,
-4. pripravi oba uzly pres `PREPARE`,
-5. posle broadcast `SYNC_START`,
-6. po 2 ms posle broadcast `DISARM`.
-
-Pozor: slot 3 je pri mereni prepsan. Pro presne mereni pouzij debug GPIO12 na obou slave uzlech, ne servo PWM. Delku behu lze zmenit napr. na 10 ms:
+## Příkaz relay
 
 ```text
-can measure_sync 10
-```
-
-Na osciloskopu sleduj debug vystup na obou slave uzlech:
-
-```text
-CH1 = node1 GPIO12 debug
-CH2 = node2 GPIO12 debug
-GND = spolecna zem robotu
-```
-
-GPIO12 jde do `HIGH`, kdyz slave skutecne zacne vykonavat merici program po `SYNC_START`, a do `LOW`, kdyz prijde `DISARM`. Rozdil nabeznych hran je rozdil startu uzlu; rozdil sestupnych hran je rozdil ukonceni.
-
-## Relay orchestrator
-
-Pro sekvencni predavani kostky mezi dvema roboty je prakticke pouzit:
-
-- lokalni G-code na kazdem uzlu jen pro jeho vlastni pohyby
-- nad tim centralni master orchestrator pres CAN
-
-Prikaz:
-
-```text
-can relay [cycles]
-```
-
-udela tuto sekvenci:
-
-1. `arm` node 1
-2. `arm` node 2
-3. posle broadcast `HOME` na oba nody, takze reference/home startuje soucasne
-4. ceka, az se oba nody vrati do `READY`
-5. spusti `PROGRAM_RUN` po jednotlivych krocich:
-   - `node2 slot0`: `HOME -> pick A -> place B -> HOME`
-   - `node1 slot0`: `HOME -> pick B -> place C -> HOME`
-   - `node1 slot1`: `pick C -> place B -> HOME`
-   - `node2 slot1`: `pick B -> place A -> HOME`
-
-Rozlozeni po oprave:
-
-- `node2` = levy robot = body `A <-> B`
-- `node1` = pravy robot = body `B <-> C`
-
-Tohle je sekvencni orchestrator. Nepouziva `PREPARE + SYNC_START`, protoze pro predavani kostky je tady spravne spoustet jednotlive programy az po dokonceni predchoziho kroku.
-
-Relay bezi na pozadi, takze konzole zustava funkcni. Za behu pouzij:
-
-```text
+can relay
+can relay 3
 can relay status
 can relay stop
 ```
 
-Pri cekani na dokonceni kroku relay nepouziva opakovane `GET_STATUS`; cte jen posledni periodicky posilany status z cache masteru.
-
-Typicky postup:
+Relay orchestrátor běží na pozadí. Na začátku nahraje tyto soubory ze SPIFFS:
 
 ```text
-can upload_file 1 0 node1_slot0.gcode
-can upload_file 2 0 node2_slot0.gcode
-can upload_file 2 1 node2_slot1.gcode
-can upload_file 1 1 node1_slot1.gcode
-can relay
+node1 slot0 ← node1_slot0.gcode
+node2 slot0 ← node2_slot0.gcode
+node2 slot1 ← node2_slot1.gcode
+node1 slot1 ← node1_slot1.gcode
 ```
 
-Pro opakovani ukazky vic krat za sebou muzes pouzit treba:
+Poté provede `arm + home` pro oba uzly se synchronním broadcastem `HOME` a spustí kroky sekvenčně:
 
 ```text
-can relay 3
+node2 slot0
+node1 slot0
+node1 slot1
+node2 slot1
 ```
 
-## Kde co nastavit
+`cycles` určuje počet opakování sekvence. Výchozí hodnota je `1`.
 
-- SPI piny, MCP2515 oscilator, bitrate, timeouty: `main/can_master/can_master.h`
-- Nody pro `all` v konzoli: `main/cmd_control/cmd_control.c` (`CONFIGURED_NODE_IDS`)
-- Vychozi G-code program pro `can upload`: `main/cmd_control/cmd_control.c` (`DEFAULT_GCODE`)
-- SPIFFS soubory se berou z adresare `spiffs/` (napr. `spiffs/example.gcode`)
+## Příkaz measure_sync
 
-## Co vraci status a sensors
+```text
+can measure_sync
+can measure_sync 10
+```
 
-- `can status <node|all>` vypise jen `armed/disarmed` a `wcofs`
-- `can sensors <node|all>` vypise natozeni senzoru/kloubu v deg
+Měření latence synchronizace. Použije slot `3`, nahraje krátký program na oba uzly, připraví je, odešle `SYNC_START` a po uplynutí zadané doby odešle `DISARM`. Výchozí doba je `2 ms`.
 
-Slave posila tyto hodnoty po `GET_STATUS` pres `CAN_INFO` ramce na `0x780 + node_id`. Master z nich pouziva jen:
+## Konfigurace
 
-- `CAN_INFO_WORK_OFFSET (0x01)` pro `wcofs`
-- `CAN_INFO_TCP_META (0x03)` kvuli `value_source`
-- `CAN_INFO_VALUES_0_2 (0x10)` a `CAN_INFO_VALUES_3_5 (0x11)` pro hodnoty senzoru
+| Co                          | Soubor                               |
+|-----------------------------|--------------------------------------|
+| CAN piny, bitrate, ID uzlů, timeouty | `main/can_master/can_master.h`  |
+| Konzolové příkazy, relay    | `main/cmd_control/cmd_control.c`     |
+| Relay sloty, timeouty       | `main/cmd_control/cmd_control.h`     |
+| SPIFFS partition            | `partitions.csv`                     |
