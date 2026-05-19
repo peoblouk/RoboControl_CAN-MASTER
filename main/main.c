@@ -9,7 +9,6 @@
 #include "status_led.h"
 
 static const char *TAG = "main_node";
-//can measure_sync 1000
 static const uint8_t ROBOT_NODE_IDS[] = {CAN_MASTER_NODE1_ID, CAN_MASTER_NODE2_ID};
 #define ROBOT_NODE_COUNT (sizeof(ROBOT_NODE_IDS) / sizeof(ROBOT_NODE_IDS[0]))
 

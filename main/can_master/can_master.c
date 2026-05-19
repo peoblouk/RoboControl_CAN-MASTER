@@ -28,7 +28,6 @@ static const char *TAG = "can_master";
 #define INFO_MASK_VALUES_0_2   (1U << 2)
 #define INFO_MASK_VALUES_3_5   (1U << 3)
 #define INFO_MASK_SENSORS      (INFO_MASK_META | INFO_MASK_VALUES_0_2 | INFO_MASK_VALUES_3_5)
-#define CAN_FLAG_ARMED         (1U << 0)
 
 #define MCP_RESET 0xC0
 #define MCP_READ 0x03
@@ -162,15 +161,6 @@ const char *can_master_protocol_result_to_str(can_protocol_result_t code)
         case CAN_PROTO_ERR_NOT_READY: return "not_ready";
         case CAN_PROTO_ERR_FILE: return "file";
         case CAN_PROTO_ERR_EXEC: return "exec";
-        default: return "unknown";
-    }
-}
-
-const char *can_master_info_source_to_str(can_info_value_source_t source)
-{
-    switch (source) {
-        case CAN_INFO_SOURCE_EST_JOINTS: return "est_joints";
-        case CAN_INFO_SOURCE_ADC_SENSORS: return "adc_sensors";
         default: return "unknown";
     }
 }

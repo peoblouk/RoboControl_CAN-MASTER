@@ -95,6 +95,5 @@ esp_err_t can_master_wait_sensor_values(uint8_t node_id, can_master_sensor_value
 bool can_master_node_is_online(uint8_t node_id, uint32_t max_age_ms);
 size_t can_master_count_online_nodes(const uint8_t *node_ids, size_t node_count, uint32_t max_age_ms);
 const char *can_master_protocol_result_to_str(can_protocol_result_t code);
-const char *can_master_info_source_to_str(can_info_value_source_t source);
 
 #endif // CAN_MASTER_H

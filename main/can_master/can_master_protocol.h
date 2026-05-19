@@ -31,7 +31,6 @@ typedef enum {
 
 typedef enum {
     CAN_INFO_WORK_OFFSET = 0x01,
-    CAN_INFO_TCP_WORK_XYZ = 0x02,
     CAN_INFO_TCP_META = 0x03,
     CAN_INFO_VALUES_0_2 = 0x10,
     CAN_INFO_VALUES_3_5 = 0x11,
