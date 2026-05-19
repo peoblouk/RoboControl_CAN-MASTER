@@ -1,10 +1,6 @@
 # CAN Master
 
-<<<<<<< HEAD
 ESP-IDF aplikace pro ESP32-C3 (Stamp-C3U) s MCP2515. Po startu inicializuje NVS, připojí SPIFFS, spustí CAN master a konzoli s příkazem `can`. Na pozadí běží status LED indikující stav uzlů.
-=======
-CAN master pro ESP32-C3. Po startu inicializuje CAN, spusti konzoli a umozni ovladat roboticke nody pres prikaz `can`.
->>>>>>> e24f9bc30abd95e88c6dba4b0c24f3460c424ae6
 
 ## Hardware
 
@@ -28,11 +24,7 @@ idf.py set-target esp32c3
 idf.py -p PORT build flash monitor
 ```
 
-<<<<<<< HEAD
 SPIFFS image se sestaví z adresáře `spiffs/`. Soubor `spiffs/example.gcode` je na zařízení dostupný jako `/spiffs/example.gcode`.
-=======
-Po připojení monitoru lze zadat příkazy do konzole (`>>`).
->>>>>>> e24f9bc30abd95e88c6dba4b0c24f3460c424ae6
 
 ## Příkazy
 
