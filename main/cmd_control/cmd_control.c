@@ -81,7 +81,6 @@ static const char CAN_USAGE[] =
     "  can delete <node|all> <slot>\n"
     "  can stop\n"
     "  can sync\n"
-    "  can measure_sync [duration_ms]\n"
     "  can upload <node|all> <slot>   (uploads DEFAULT_GCODE)\n"
     "  can upload_file <node|all> <slot> <path>   (loads /spiffs/<path>)\n"
     "  can seq [slot]\n"
@@ -766,60 +765,6 @@ static int cmd_can_seq(int argc, char **argv)
     return 0;
 }
 
-static int cmd_can_measure_sync(int argc, char **argv)
-{
-    uint32_t duration_ms = SYNC_MEASURE_DEFAULT_DURATION_MS;
-    if (argc == 3 &&
-        !parse_u32_arg(argv[2], SYNC_MEASURE_MIN_DURATION_MS, SYNC_MEASURE_MAX_DURATION_MS, &duration_ms)) {
-        printf("ERR: invalid duration_ms, use %u..%u\n",
-               (unsigned)SYNC_MEASURE_MIN_DURATION_MS,
-               (unsigned)SYNC_MEASURE_MAX_DURATION_MS);
-        return 0;
-    }
-
-    const uint32_t dwell_ms = duration_ms + SYNC_MEASURE_STOP_MARGIN_MS;
-    char measure_gcode[SYNC_MEASURE_GCODE_BUFFER_SIZE] = {0};
-    int written = snprintf(measure_gcode,
-                           sizeof(measure_gcode),
-                           "G21\nG90\nG4 P%u\nM30\n",
-                           (unsigned)dwell_ms);
-    if (written <= 0 || (size_t)written >= sizeof(measure_gcode)) {
-        printf("ERR: measure G-code build failed\n");
-        return 0;
-    }
-
-    printf("MEASURE_SYNC: one-shot setup uses slot=%u and overwrites it\n", (unsigned)SYNC_MEASURE_SLOT);
-    (void)stop_all_flushed(100);
-
-    printf("MEASURE_SYNC: broadcast ARM\n");
-    esp_err_t err = can_master_arm_all();
-    if (err != ESP_OK) {
-        printf("ERR: arm all failed (%s)\n", esp_err_to_name(err));
-        return 0;
-    }
-    vTaskDelay(pdMS_TO_TICKS(100));
-    can_master_clear_pending_responses();
-
-    if (upload_program_all(SYNC_MEASURE_SLOT, "MEASURE_SYNC", (const uint8_t *)measure_gcode, strlen(measure_gcode)) != ESP_OK) return 0;
-    if (prepare_all(SYNC_MEASURE_SLOT, "MEASURE_SYNC") != ESP_OK) return 0;
-
-    can_master_clear_pending_responses();
-    printf("MEASURE_SYNC: t=0 ms send SYNC_START\n");
-    err = can_master_sync_start_all();
-    if (err != ESP_OK) {
-        printf("ERR: sync start failed (%s)\n", esp_err_to_name(err));
-        return 0;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
-    printf("MEASURE_SYNC: t=%u ms send DISARM\n", (unsigned)duration_ms);
-    err = can_master_disarm_all();
-    vTaskDelay(pdMS_TO_TICKS(50));
-    can_master_clear_pending_responses();
-    printf(err == ESP_OK ? "OK: measure_sync finished\n" : "ERR: disarm failed\n");
-    return 0;
-}
-
 static esp_err_t relay_execute_cycles(uint32_t cycles)
 {
     static const relay_step_t relay_steps[] = {
@@ -965,10 +910,6 @@ static int cmd_can(int argc, char **argv)
         esp_err_t err = can_master_sync_start_all();
         printf(err == ESP_OK ? "OK: sync start sent\n" : "ERR: sync start failed\n");
         return 0;
-    }
-    if (strcmp(cmd, "measure_sync") == 0) {
-        if (argc != 2 && argc != 3) return usage("can measure_sync [duration_ms]");
-        return cmd_can_measure_sync(argc, argv);
     }
     if (strcmp(cmd, "run_sync") == 0) {
         if (argc != 4 && argc != 5) return usage("can run_sync all <path> [slot]");

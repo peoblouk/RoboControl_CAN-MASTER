@@ -31,14 +31,6 @@
 #define RELAY_FORWARD_SLOT 0U
 #define RELAY_RETURN_SLOT  1U
 
-/* Sync latency measurement */
-#define SYNC_MEASURE_DEFAULT_DURATION_MS 2U
-#define SYNC_MEASURE_MIN_DURATION_MS     1U
-#define SYNC_MEASURE_MAX_DURATION_MS     60000U
-#define SYNC_MEASURE_SLOT                3U
-#define SYNC_MEASURE_STOP_MARGIN_MS      3000U
-#define SYNC_MEASURE_GCODE_BUFFER_SIZE   192U
-
 /* run_sync default target slot */
 #define RUN_SYNC_DEFAULT_SLOT 0U
 
