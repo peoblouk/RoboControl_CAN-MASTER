@@ -40,6 +40,12 @@ typedef struct {
     const char *label;
 } relay_step_t;
 
+typedef struct {
+    uint8_t node_id;
+    uint8_t slot;
+    const char *path;
+} relay_upload_entry_t;
+
 static const char *TAG = "cmd";
 static volatile bool s_relay_running;
 static volatile bool s_relay_stop_requested;
@@ -765,6 +771,40 @@ static int cmd_can_seq(int argc, char **argv)
     return 0;
 }
 
+static esp_err_t relay_upload_programs(void)
+{
+    static const relay_upload_entry_t uploads[] = {
+        {CAN_MASTER_NODE1_ID, RELAY_FORWARD_SLOT, "/spiffs/node1_slot0.gcode"},
+        {CAN_MASTER_NODE2_ID, RELAY_FORWARD_SLOT, "/spiffs/node2_slot0.gcode"},
+        {CAN_MASTER_NODE1_ID, RELAY_RETURN_SLOT,  "/spiffs/node1_slot1.gcode"},
+        {CAN_MASTER_NODE2_ID, RELAY_RETURN_SLOT,  "/spiffs/node2_slot1.gcode"},
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(uploads); i++) {
+        const relay_upload_entry_t *u = &uploads[i];
+        uint8_t *data = NULL;
+        size_t size = 0;
+        esp_err_t err = load_file_from_spiffs(u->path, &data, &size);
+        if (err != ESP_OK) {
+            printf("ERR: relay upload: read %s failed (%s)\n", u->path, esp_err_to_name(err));
+            return err;
+        }
+        printf("RELAY: upload node=%u slot=%u from %s (%u B)\n",
+               (unsigned)u->node_id, (unsigned)u->slot, u->path, (unsigned)size);
+        can_master_clear_pending_responses();
+        err = can_master_upload_gcode_program(u->node_id, u->slot, data, size, CAN_MASTER_RESPONSE_TIMEOUT_MS);
+        free(data);
+        if (err != ESP_OK) {
+            printf("ERR: relay upload: node=%u slot=%u failed (%s)\n",
+                   (unsigned)u->node_id, (unsigned)u->slot, esp_err_to_name(err));
+            return err;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        can_master_clear_pending_responses();
+    }
+    return ESP_OK;
+}
+
 static esp_err_t relay_execute_cycles(uint32_t cycles)
 {
     static const relay_step_t relay_steps[] = {
@@ -774,14 +814,17 @@ static esp_err_t relay_execute_cycles(uint32_t cycles)
         {CAN_MASTER_NODE2_ID, RELAY_RETURN_SLOT,  "node2 return:  pick B -> place A -> HOME"},
     };
 
+    esp_err_t err = relay_upload_programs();
+    if (err != ESP_OK) return err;
+
     for (size_t i = 0; i < CONFIGURED_NODE_COUNT; i++) {
         uint8_t node = CONFIGURED_NODE_IDS[i];
         printf("RELAY: arm + home node=%u\n", (unsigned)node);
-        esp_err_t err = relay_arm_and_home_node(node);
+        err = relay_arm_and_home_node(node);
         if (err != ESP_OK) return err;
     }
 
-    esp_err_t err = relay_broadcast_home_all();
+    err = relay_broadcast_home_all();
     if (err != ESP_OK) return err;
 
     for (uint32_t cycle = 0; cycle < cycles; cycle++) {
